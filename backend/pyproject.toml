@@ -1,0 +1,35 @@
+[project]
+name = "backend"
+version = "0.1.0"
+description = "remind me backend"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "chromadb>=1.5.5",
+    "deepface>=0.0.99",
+    "edge-tts>=7.0.0",
+    "fastapi[standard]",
+    "google-genai>=1.68.0",
+    "transformers>=4.50.0",
+    "sentencepiece>=0.2.0",
+    "faster-whisper>=1.1.0",
+    "opencv-python-headless>=4.13.0.92", # Switched to headless
+    "pydantic>=2.12.5",
+    "python-dotenv>=1.2.2",
+    "python-multipart>=0.0.22",
+    "speechbrain>=1.0.0",
+    "tf-keras>=2.21.0",
+    "transformers>=4.40.0", # Adding Transformers for DINOv2
+    "ultralytics>=8.3.0",
+    "uvicorn[standard]",
+    "websockets>=16.0",
+]
+
+# Add the CPU-only source if you don't have a GPU
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }

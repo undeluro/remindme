@@ -1,0 +1,67 @@
+{
+    "routines": [],
+    "reminders": [
+        {
+            "time": "11:00 AM",
+            "task": "Take medicine"
+        },
+        {
+            "time": "10:00 AM",
+            "task": "Finish project"
+        },
+        {
+            "time": "Tomorrow",
+            "task": "Dark Prince concert"
+        },
+        {
+            "time": "Every day for the next 7 days",
+            "task": "drink from the cup"
+        },
+        {
+            "time": "19:00",
+            "task": "Take aspirin"
+        }
+    ],
+    "notes": [
+        "shopping list: bread, milk, and chili pepper"
+    ],
+    "objects": [
+        {
+            "name": "my car",
+            "notes": "This is my car.",
+            "dosage": "",
+            "schedule": "",
+            "category": ""
+        }
+    ],
+    "face_conversations": {
+        "Dima": {
+            "topics": [
+                "Planing the trip to Japan."
+            ],
+            "last_topic": "Planing the trip to Japan.",
+            "last_seen": "2026-04-18T23:55:30.885483"
+        },
+        "Niyaz": {
+            "topics": [
+                "Playing football on Monday."
+            ],
+            "last_topic": "Playing football on Monday.",
+            "last_seen": "2026-04-19T02:54:16.304659"
+        },
+        "Mikhail": {
+            "topics": [
+                "Conversation about Java virtual threads."
+            ],
+            "last_topic": "Conversation about Java virtual threads.",
+            "last_seen": "2026-04-19T03:00:01.437951"
+        },
+        "Roman": {
+            "topics": [
+                "Armrestling fascination."
+            ],
+            "last_topic": "Armrestling fascination.",
+            "last_seen": "2026-04-19T02:59:31.205277"
+        }
+    }
+}
