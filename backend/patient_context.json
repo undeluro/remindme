@@ -1,5 +1,7 @@
 {
-    "routines": [],
+    "routines": [
+        "Drink beer two times a day"
+    ],
     "reminders": [
         {
             "time": "11:00 AM",
@@ -20,10 +22,15 @@
         {
             "time": "19:00",
             "task": "Take aspirin"
+        },
+        {
+            "time": "8:00 PM",
+            "task": "take pillows"
         }
     ],
     "notes": [
-        "shopping list: bread, milk, and chili pepper"
+        "shopping list: bread, milk, and chili pepper",
+        "\u0414\u0438\u043c\u043a\u0430 \u0440\u0430\u0441\u0441\u043a\u0430\u0437\u044b\u0432\u0430\u043b \u043f\u0440\u043e \u0441\u0432\u043e\u0439 \u043f\u0440\u043e\u0435\u043a\u0442"
     ],
     "objects": [
         {
@@ -84,6 +91,72 @@
             "label_text": "NUROFEN Rapid Mini 400 mg c\u00e1psulas blandas Ibuprofeno V\u00eda oral",
             "label_name": "NUROFEN Rapid Mini",
             "label_dosage": "400 mg"
+        },
+        {
+            "name": "Teddy bear stich",
+            "notes": "",
+            "dosage": "",
+            "schedule": "",
+            "category": "other",
+            "detector_class": "teddy bear",
+            "label_text": "Stich",
+            "label_name": "",
+            "label_dosage": ""
+        },
+        {
+            "name": "Terbinafina Ziaja",
+            "notes": "This is cream for hands",
+            "dosage": "10 mg/g",
+            "schedule": "Use 2 times a day",
+            "category": "medicine",
+            "detector_class": "book",
+            "label_text": "Terbinafina Ziaja Terbinafini hydrochloridum, 10 mg/g, krem Lek o miejscowym dzia\u0142aniu przeciwgrzybiczym Podanie na sk\u00f3r\u0119.",
+            "label_name": "Terbinafina Ziaja",
+            "label_dosage": "10 mg/g"
+        },
+        {
+            "name": "Coca-Cola zero",
+            "notes": "My favorite drink",
+            "dosage": "",
+            "schedule": "",
+            "category": "food",
+            "detector_class": "redbull",
+            "label_text": "Coca-Cola zero cukru",
+            "label_name": "Coca-Cola zero",
+            "label_dosage": ""
+        },
+        {
+            "name": "My phone",
+            "notes": "This is gift from my sister",
+            "dosage": "",
+            "schedule": "",
+            "category": "device",
+            "detector_class": "cell phone",
+            "label_text": "",
+            "label_name": "",
+            "label_dosage": ""
+        },
+        {
+            "name": "IBUPROM SPRINT",
+            "notes": "Use when you have headache",
+            "dosage": "200 mg",
+            "schedule": "1 pillow in 4 hours",
+            "category": "medicine",
+            "detector_class": "medicine box",
+            "label_text": "IBUPROM SPRINT Ibuprofenum, 200 mg, kapsu\u0142ki mi\u0119kkie 200 mg USP Zdrowie Lek na b\u00f3l, gor\u0105czk\u0119 i stan zapalny 10 kapsu\u0142ek",
+            "label_name": "IBUPROM SPRINT",
+            "label_dosage": "200 mg"
+        },
+        {
+            "name": "Watch",
+            "notes": "My xiomi watch",
+            "dosage": "",
+            "schedule": "",
+            "category": "device",
+            "detector_class": "watch",
+            "label_text": "",
+            "label_name": "",
+            "label_dosage": ""
         }
     ],
     "face_conversations": {
@@ -114,6 +187,25 @@
             ],
             "last_topic": "Armrestling fascination.",
             "last_seen": "2026-04-19T02:59:31.205277"
+        },
+        "Niaz": {
+            "topics": [],
+            "last_topic": "",
+            "last_seen": "2026-10-03T22:44:58.733400"
+        },
+        "Dimka": {
+            "topics": [
+                "Dimka is going to school Monday"
+            ],
+            "last_topic": "Dimka is going to school Monday",
+            "last_seen": "2026-10-03T22:49:40.266211"
+        },
+        "Kris": {
+            "topics": [
+                "Discussing how to use app features"
+            ],
+            "last_topic": "Discussing how to use app features",
+            "last_seen": "2026-10-03T22:56:23.756047"
         }
     }
 }

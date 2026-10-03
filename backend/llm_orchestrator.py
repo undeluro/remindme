@@ -17,8 +17,14 @@ class CommandAction(BaseModel):
     user_transcript: str = Field(
         description="The exact text of what the user said in the audio."
     )
-    action: Literal["add_note", "set_reminder", "retrieve_memory", "recognize_object", "respond"] = Field(
+    action: Literal["add_note", "set_reminder", "retrieve_memory", "recognize_object", "add_topic", "respond"] = Field(
         description="The action to take based on the user's command."
+    )
+    topic_person: Optional[str] = Field(
+        None, description="If action is add_topic: the name of the person the conversation was with, exactly as in the known people list. Empty if the user didn't say who."
+    )
+    topic_text: Optional[str] = Field(
+        None, description="If action is add_topic: what they talked about, as a short topic of 3-8 words in English."
     )
     note_text: Optional[str] = Field(
         None, description="The text content of the note, if action is add_note or recognize_object."
@@ -40,6 +46,16 @@ class CommandAction(BaseModel):
     )
 
 
+class ConversationTopic(BaseModel):
+    """Structured output for summarizing a conversation with a known person."""
+    has_topic: bool = Field(
+        description="True only if the audio contains a real conversation with a clear subject. False for silence, noise, TV, or just greetings."
+    )
+    topic: str = Field(
+        "", description="The main subject of the conversation as a short topic of 3-8 words in English, e.g. 'Planning a trip to Japan'."
+    )
+
+
 class SceneUpdate(BaseModel):
     """Structured output for the ambient context check."""
     changed: bool = Field(
@@ -51,6 +67,7 @@ class SceneUpdate(BaseModel):
 
 
 LABEL_IMAGE_MAX_SIDE = 640  # px — enough to read a label held near the camera, and faster to upload
+LABEL_READ_ATTEMPTS = 2  # Gemini sometimes answers 503 "high demand" — retry once before giving up
 
 
 def _shrink_jpeg(data: bytes) -> bytes:
@@ -119,6 +136,7 @@ Actions:
 - set_reminder: Set a reminder for a specific time/event
 - retrieve_memory: Search past memories/notes for information
 - recognize_object: The user wants to save/remember an object currently visible in front of the camera. Extract the note/description they want to attach (note_text) and optionally the name they use for the object (object_name). The system will detect and photograph the central object automatically.
+- add_topic: The user wants to remember what they talked about with a person (e.g. "remember that Dimka told me about his exam", "save that we talked about the trip"). Set topic_person to that person's name from the known people list (leave it empty if they didn't say who — the person in front of the camera is used) and topic_text to a short topic.
 - respond: Just respond conversationally (no special action needed)
 
 Always provide a friendly spoken_response.
@@ -145,36 +163,73 @@ When the user mentions wanting to remember, save, or recognize an object/item/th
             print(f"Error processing command: {e}")
             return {"action": "respond", "spoken_response": f"Sorry, I had trouble understanding that. ({e})"}
 
-    async def read_label(self, images_jpeg: list[bytes]) -> dict:
-        """Read the printed text on an object from one or more photos of it (different angles).
+    async def summarize_conversation(self, person: str, relation: str, audio_chunks: list[bytes]) -> str:
+        """Turn the recorded audio of a conversation with a known person into a short topic.
 
-        Returns {"text", "product_name", "dosage"} — all empty when nothing is readable or Gemini is unavailable.
+        Gemini gets the audio itself (not Whisper's text), so conversations in any language work.
+        Returns "" when there was no real conversation or the call failed.
         """
-        empty = {"text": "", "product_name": "", "dosage": ""}
-        if not self.client or not images_jpeg:
-            return empty
+        if not self.client or not audio_chunks:
+            return ""
+        parts = [types.Part.from_bytes(data=chunk, mime_type="audio/webm") for chunk in audio_chunks]
+        parts.append(
+            f"These audio clips are consecutive parts of a conversation between the user and {person}"
+            f"{f' ({relation})' if relation else ''}, possibly in any language. "
+            "What was the main subject? If there was no real conversation with a clear subject "
+            "(only silence, noise, TV, or greetings), set has_topic=false."
+        )
         try:
-            parts = [types.Part.from_bytes(data=_shrink_jpeg(img), mime_type="image/jpeg") for img in images_jpeg]
-            parts.append(
-                "These photos show the same object from different angles. Read the printed text on it "
-                "(for medicine: the name and the strength). Only report text you can actually read — never guess."
-            )
             response = await self.client.aio.models.generate_content(
                 model="gemini-3.1-flash-lite-preview",
                 contents=parts,
                 config={
                     "response_mime_type": "application/json",
-                    "response_json_schema": LabelReading.model_json_schema(),
-                    # Reading text needs no reasoning — thinking only adds latency (~3.9s -> ~2.5s)
+                    "response_json_schema": ConversationTopic.model_json_schema(),
                     "thinking_config": {"thinking_level": "minimal"},
                 }
             )
-            reading = LabelReading.model_validate_json(response.text)
-            print(f"[LLM] Label read: {reading.model_dump()}")
-            return reading.model_dump()
+            result = ConversationTopic.model_validate_json(response.text)
+            print(f"[LLM] Conversation with {person}: {result.model_dump()}")
+            return result.topic.strip() if result.has_topic else ""
         except Exception as e:
-            print(f"Error reading label: {e}")
-            return empty
+            print(f"Error summarizing conversation with {person}: {e}")
+            return ""
+
+    async def read_label(self, images_jpeg: list[bytes]) -> dict:
+        """Read the printed text on an object from one or more photos of it (different angles).
+
+        Returns {"text", "product_name", "dosage"} — all empty when nothing is readable.
+        If Gemini fails (e.g. 503 overloaded) even after a retry, "error": True is added: that means
+        "unknown", NOT "no text" — callers must not treat a failed read as an unlabelled object.
+        """
+        empty = {"text": "", "product_name": "", "dosage": ""}
+        if not self.client or not images_jpeg:
+            return {**empty, "error": True}
+        parts = [types.Part.from_bytes(data=_shrink_jpeg(img), mime_type="image/jpeg") for img in images_jpeg]
+        parts.append(
+            "These photos show the same object from different angles. Read the printed text on it "
+            "(for medicine: the name and the strength). Only report text you can actually read — never guess."
+        )
+        for attempt in range(LABEL_READ_ATTEMPTS):
+            try:
+                response = await self.client.aio.models.generate_content(
+                    model="gemini-3.1-flash-lite-preview",
+                    contents=parts,
+                    config={
+                        "response_mime_type": "application/json",
+                        "response_json_schema": LabelReading.model_json_schema(),
+                        # Reading text needs no reasoning — thinking only adds latency (~3.9s -> ~2.5s)
+                        "thinking_config": {"thinking_level": "minimal"},
+                    }
+                )
+                reading = LabelReading.model_validate_json(response.text)
+                print(f"[LLM] Label read: {reading.model_dump()}")
+                return reading.model_dump()
+            except Exception as e:
+                print(f"Error reading label (attempt {attempt + 1}/{LABEL_READ_ATTEMPTS}): {e}")
+                if attempt + 1 < LABEL_READ_ATTEMPTS:
+                    await asyncio.sleep(0.5)
+        return {**empty, "error": True}
 
     async def generate_ambient_summary(self, base64_image: str, previous_summary: str = "") -> str:
         """Describe the surroundings, or return "" when nothing meaningful changed since previous_summary."""

@@ -12,6 +12,12 @@ services:
     volumes:
       - ./backend:/app
       - chroma_data:/app/chroma_data
+      # Keep the Python packages (~8 GB) and downloaded models in Docker volumes, not in the bind-mounted
+      # project folder: reading them through the Windows/macOS file share made every backend restart
+      # take 5-8 minutes. The venv volume is filled from the image on first start, so nothing is reinstalled.
+      - backend_venv:/app/.venv
+      - model_cache:/root/.cache
+      - deepface_weights:/root/.deepface
     command: uv run fastapi dev --host 0.0.0.0
     restart: unless-stopped
 
@@ -32,3 +38,6 @@ services:
 volumes:
   chroma_data:
   frontend_node_modules:
+  backend_venv:
+  model_cache:
+  deepface_weights:

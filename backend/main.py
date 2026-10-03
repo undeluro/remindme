@@ -2,6 +2,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import datetime
+import difflib
 import json
 import asyncio
 import os
@@ -12,8 +13,26 @@ ssl._create_default_https_context = ssl._create_unverified_context
 
 load_dotenv()
 
+# Every ML library (TensorFlow for faces, PyTorch for objects, CTranslate2 for Whisper, OpenMP/MKL)
+# otherwise starts one thread per CPU core. Running side by side they spawned ~180 threads that fought
+# over the CPU, making each model several times slower (Whisper 0.7 s -> 3-7 s). Cap each one.
+# Must happen before those libraries are imported.
+MODEL_THREADS = int(os.environ.get("MODEL_THREADS", "4"))
+for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+    os.environ.setdefault(_var, str(MODEL_THREADS))
+
+import torch
+import tensorflow as tf
+
+torch.set_num_threads(MODEL_THREADS)
+tf.config.threading.set_intra_op_parallelism_threads(MODEL_THREADS)
+tf.config.threading.set_inter_op_parallelism_threads(2)
+
 import cv2
 import numpy as np
+
+cv2.setNumThreads(MODEL_THREADS)
+
 from face_processor import FaceProcessor, FaceTracker
 from audio_processor import AudioProcessor
 from llm_orchestrator import LLMOrchestrator
@@ -63,7 +82,14 @@ object_processor = ObjectProcessor()
 label_reader = LLMOrchestrator(ws_send_callback=None)  # Gemini client for reading text on objects (HTTP endpoints)
 
 LABEL_READ_MAX_SHOTS = 3  # photos sent to Gemini when reading a label at save time
+TOPIC_AFTER_SECONDS = 20.0  # a conversation ends when its person has been out of view this long
+TOPIC_CHECK_SECONDS = 5.0  # how often to check for finished conversations
+MIN_TOPIC_SPEECH_SECONDS = 15.0  # shorter (e.g. just "hi") gives no topic, so the last one isn't overwritten
+AUDIO_CHUNK_SECONDS = 1.5  # length of one audio chunk — matches HOTWORD_CHUNK_MS in frontend/src/App.jsx
+MAX_TOPIC_CHUNKS = 240  # keep at most the last ~6 minutes of speech per conversation
 LABEL_CACHE_SECONDS = 4.0  # ambient: reuse a label reading for an object that hasn't moved
+LABEL_RETRY_SECONDS = 2.0  # ambient: wait this long before retrying a failed label read
+LABEL_PENDING_SECONDS = 30.0  # ambient: forget an unfinished/failed reading after this (object probably gone)
 
 class AddFaceRequest(BaseModel):
     name: str
@@ -180,25 +206,29 @@ class AddObjectRequest(BaseModel):
 class PrepareObjectRequest(BaseModel):
     frames: list[str]  # base64 JPEG frames taken over ~3 seconds while the object is turned
     hint_box: dict | None = None  # where the object was when "+ Save" was pressed, % of the frame
+    hint_boxes: list[dict | None] = []  # optional: where the object was in each frame (it moves when turned)
 
 @app.post("/api/objects/prepare")
 async def prepare_object(req: PrepareObjectRequest):
     """Find and crop the object in each frame, and read any text printed on it."""
+    def hint_for(i):
+        return (req.hint_boxes[i] if i < len(req.hint_boxes) else None) or req.hint_box
+
     if req.hint_box:
         # Read the label from where the object was (evenly spread frames) while detection runs —
         # Gemini (~2 s) and detecting the object in every frame (~1-3 s) overlap instead of adding up
         step = max(1, len(req.frames) // LABEL_READ_MAX_SHOTS)
-        label_frames = req.frames[::step][:LABEL_READ_MAX_SHOTS]
+        label_idx = list(range(0, len(req.frames), step))[:LABEL_READ_MAX_SHOTS]
         hint_crops = await asyncio.to_thread(
-            lambda: [object_processor.get_crop_b64(f, req.hint_box) for f in label_frames]
+            lambda: [object_processor.get_crop_b64(req.frames[i], hint_for(i)) for i in label_idx]
         )
         label_task = asyncio.create_task(
             label_reader.read_label([base64.b64decode(c) for c in hint_crops if c])
         )
-        shots = await asyncio.to_thread(object_processor.prepare_shots, req.frames, req.hint_box)
+        shots = await asyncio.to_thread(object_processor.prepare_shots, req.frames, req.hint_box, req.hint_boxes)
         label = await label_task
     else:
-        shots = await asyncio.to_thread(object_processor.prepare_shots, req.frames, req.hint_box)
+        shots = await asyncio.to_thread(object_processor.prepare_shots, req.frames, req.hint_box, req.hint_boxes)
         # Largest crops are the closest views — best for reading text
         by_size = sorted(shots, key=lambda s: s["box"]["w"] * s["box"]["h"], reverse=True)
         label = await label_reader.read_label(
@@ -384,6 +414,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 # Update current visible faces for command context
                 current_faces.clear()
                 current_faces.extend(faces)
+                note_people_in_view(faces)
                 # Emit recognized faces back to the React UI
                 await manager.send_json({"type": "FACES", "faces": faces}, websocket)
         except asyncio.CancelledError:
@@ -398,22 +429,104 @@ async def websocket_endpoint(websocket: WebSocket):
                 audio_data = await audio_queue.get()
                 if manager.mode != "AMBIENT":
                     continue
-                is_hotword, _transcript = await audio_processor.detect_hotword(audio_data)
+                is_hotword, transcript = await audio_processor.detect_hotword(audio_data)
                 if is_hotword and manager.mode == "AMBIENT":
                     print("========== COMMAND MODE ACTIVATED ==========")
                     await manager.set_mode("COMMAND", websocket)
+                elif transcript:
+                    # Someone spoke — part of the conversation with whoever is in view
+                    record_conversation_audio(base64.b64decode(audio_data))
         except asyncio.CancelledError:
             pass
         except Exception as e:
             print(f"Audio loop error: {e}")
 
+    # ---------- Conversation topics ----------
+    # While a known person is in view, chunks with speech are collected per person. When they have been
+    # out of view for TOPIC_AFTER_SECONDS (or assisting stops / the app closes), Gemini turns the audio
+    # into a short topic that is saved for that person and shown on their tag next time.
+    conversations = {}  # name -> {"relation", "chunks": [webm bytes], "speech_seconds", "last_seen"}
+    settings = {"auto_topics": True}  # toggled from the Settings panel
+
+    def note_people_in_view(faces: list[dict]):
+        now = asyncio.get_running_loop().time()
+        for f in faces:
+            if f["name"] == "Unknown Person":
+                continue
+            entry = conversations.setdefault(f["name"], {
+                "relation": f.get("relation", ""), "chunks": [], "speech_seconds": 0.0, "last_seen": now,
+            })
+            entry["last_seen"] = now
+
+    def record_conversation_audio(chunk: bytes):
+        if not settings["auto_topics"]:
+            return
+        for f in current_faces:
+            entry = conversations.get(f["name"])
+            if entry is None:
+                continue
+            entry["chunks"].append(chunk)
+            entry["chunks"] = entry["chunks"][-MAX_TOPIC_CHUNKS:]
+            entry["speech_seconds"] += AUDIO_CHUNK_SECONDS
+
+    async def finish_conversation(name: str, convo: dict):
+        if convo["speech_seconds"] < MIN_TOPIC_SPEECH_SECONDS:
+            print(f"[Topics] {name}: only {convo['speech_seconds']:.0f}s of speech — no topic saved")
+            return
+        print(f"[Topics] {name}: summarizing {convo['speech_seconds']:.0f}s of conversation...")
+        topic = await llm.summarize_conversation(name, convo["relation"], convo["chunks"])
+        if not topic:
+            return
+        db.update_face_topics(name, topic)
+        await manager.send_json({"type": "CHAT", "role": "system", "content": f"Topic saved for {name}: {topic}"}, websocket)
+
+    def finish_all_conversations():
+        """Summarize every ongoing conversation now (assisting stopped or the app was closed)."""
+        for name in list(conversations):
+            asyncio.create_task(finish_conversation(name, conversations.pop(name)))
+
+    async def topic_loop():
+        """Finish a conversation once its person has been out of view for TOPIC_AFTER_SECONDS."""
+        try:
+            while True:
+                await asyncio.sleep(TOPIC_CHECK_SECONDS)
+                now = asyncio.get_running_loop().time()
+                for name in [n for n, c in conversations.items() if now - c["last_seen"] >= TOPIC_AFTER_SECONDS]:
+                    asyncio.create_task(finish_conversation(name, conversations.pop(name)))
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"Topic loop error: {e}")
+
+    def resolve_topic_person(spoken_name: str | None, visible: list[dict]) -> str | None:
+        """Who a voice-saved topic belongs to: the person named, else the (single/first) known person in view."""
+        known = [p["name"] for p in db.list_faces()]
+        if spoken_name:
+            by_lower = {k.lower(): k for k in known}
+            if spoken_name.strip().lower() in by_lower:
+                return by_lower[spoken_name.strip().lower()]
+            close = difflib.get_close_matches(spoken_name.strip().lower(), list(by_lower), n=1, cutoff=0.75)
+            if close:
+                return by_lower[close[0]]
+        in_view = [f["name"] for f in visible if f["name"] in known]
+        return in_view[0] if in_view else None
+
     # Recent label readings: [{"box", "reading" (None while Gemini is still reading), "time"}]
     label_cache = []
 
     async def read_label_into(entry: dict, crop_jpeg: bytes):
-        """Background task: read a label with Gemini and store it in its cache entry."""
-        entry["reading"] = await llm.read_label([crop_jpeg])
-        entry["time"] = asyncio.get_running_loop().time()
+        """Background task: read a label with Gemini and store it in its cache entry.
+
+        A failed read (Gemini overloaded) is not stored as a reading — the entry stays pending
+        ("checking label…") and is retried after LABEL_RETRY_SECONDS.
+        """
+        reading = await llm.read_label([crop_jpeg])
+        now = asyncio.get_running_loop().time()
+        if reading.get("error"):
+            entry["failed_at"] = now
+            return
+        entry["reading"] = reading
+        entry["time"] = now
 
     async def resolve_labels(matched: list[dict]) -> list[dict]:
         """Use the printed text to pick between look-alike saved objects (e.g. two pill boxes of one brand).
@@ -422,7 +535,10 @@ async def websocket_endpoint(websocket: WebSocket):
         the reading arrives the tag says "checking label…", then it is reused while the object stays put.
         """
         now = asyncio.get_running_loop().time()
-        label_cache[:] = [c for c in label_cache if c["reading"] is None or now - c["time"] < LABEL_CACHE_SECONDS]
+        label_cache[:] = [
+            c for c in label_cache
+            if now - c["time"] < (LABEL_PENDING_SECONDS if c["reading"] is None else LABEL_CACHE_SECONDS)
+        ]
         resolved = []
         for m in matched:
             candidates = m.pop("_candidates", [m["name"]])
@@ -440,6 +556,10 @@ async def websocket_endpoint(websocket: WebSocket):
             if cached is None and crop_jpeg:
                 cached = {"box": box, "reading": None, "time": now}
                 label_cache.append(cached)
+                asyncio.create_task(read_label_into(cached, crop_jpeg))
+            elif (cached and cached["reading"] is None and crop_jpeg and cached.get("failed_at")
+                  and now - cached["failed_at"] >= LABEL_RETRY_SECONDS):
+                cached["failed_at"] = None  # previous read failed — try again with a fresh photo
                 asyncio.create_task(read_label_into(cached, crop_jpeg))
             if cached is None or cached["reading"] is None:
                 m["label"] = "checking label…"  # look-alike match shown until the text confirms it
@@ -506,6 +626,7 @@ async def websocket_endpoint(websocket: WebSocket):
     obj_task = None
     face_task = None
     audio_task = None
+    topic_task = None
 
     try:
         await manager.connect(websocket)
@@ -513,6 +634,7 @@ async def websocket_endpoint(websocket: WebSocket):
         obj_task = asyncio.create_task(object_recognition_loop())
         face_task = asyncio.create_task(face_loop())
         audio_task = asyncio.create_task(audio_loop())
+        topic_task = asyncio.create_task(topic_loop())
 
         while True:
             data = await websocket.receive_text()
@@ -524,6 +646,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 # Just store it — face_loop picks up the newest frame when it's free
                 latest_frame = payload.get("data")
                 frame_ready.set()
+
+            elif p_type == "AUTO_TOPICS":
+                settings["auto_topics"] = bool(payload.get("enabled", True))
+                if not settings["auto_topics"]:
+                    conversations.clear()  # drop what was collected — the user turned it off
+                print(f"[Topics] Automatic conversation topics {'on' if settings['auto_topics'] else 'off'}")
 
             elif p_type == "YOLO_DEBUG":
                 manager.yolo_debug = payload.get("enabled", False)
@@ -569,6 +697,15 @@ async def websocket_endpoint(websocket: WebSocket):
                         mem_text = " | ".join(memories) if memories else "No memories found."
                         response_text = response_text or f"Memory: {mem_text}"
                         print(f"[Command] Retrieved memory for: {result['memory_query']}")
+                    elif action == "add_topic" and result.get("topic_text"):
+                        topic = result["topic_text"].strip()
+                        person = resolve_topic_person(result.get("topic_person"), face_context)
+                        if person:
+                            db.update_face_topics(person, topic)
+                            response_text = response_text or f"Got it — you talked with {person} about {topic}."
+                            print(f"[Command] Saved topic for {person}: {topic}")
+                        else:
+                            response_text = "I couldn't tell who you talked with. Please say their name."
                     elif action == "recognize_object":
                         print("[Command] recognize_object triggered — running YOLO detection...")
                         detection = await asyncio.to_thread(object_processor.detect_central_object, latest_frame)
@@ -625,6 +762,7 @@ async def websocket_endpoint(websocket: WebSocket):
             elif p_type == "COMMAND" and payload.get("command") == "STOP":
                 print("========== ASSISTING STOPPED ==========")
                 is_active = False  # Kill the ambient loop
+                finish_all_conversations()  # save topics of conversations that were still going on
                 if bg_task:
                     bg_task.cancel()
                     bg_task = None
@@ -657,7 +795,9 @@ async def websocket_endpoint(websocket: WebSocket):
         print(f"WS Exception in streaming: {e}")
     finally:
         is_active = False
-        for task in (bg_task, obj_task, face_task, audio_task):
+        # App closed / tab reloaded: still save topics of ongoing conversations (runs after the socket is gone)
+        finish_all_conversations()
+        for task in (bg_task, obj_task, face_task, audio_task, topic_task):
             if task:
                 task.cancel()
         manager.disconnect(websocket)

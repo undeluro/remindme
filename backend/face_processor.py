@@ -149,7 +149,7 @@ class FaceProcessor:
                     # Get last conversation topic from patient_context.json
                     topics = db.get_face_topics(name) or {}
                     topics_list = topics.get("topics", [])[-3:]
-                    last = topics.get("last_topic", "") or metadata.get("last_conversation", "No record")
+                    last = topics.get("last_topic", "")  # empty until there has been a conversation — the tag then shows no topic line
 
                     # Probabilistic vector accumulation — only for very confident matches
                     if distance < ACCUMULATE_MAX_DISTANCE and random.random() < ACCUMULATE_PROBABILITY:
@@ -162,8 +162,8 @@ class FaceProcessor:
                             })
                 else:
                     name = UNKNOWN
-                    relation = "N/A"
-                    last = "N/A"
+                    relation = ""
+                    last = ""
 
                 detected_faces.append({
                     "x": x_pct,

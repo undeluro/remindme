@@ -1,4 +1,5 @@
 import chromadb
+import copy
 import json
 import os
 from datetime import datetime
@@ -119,19 +120,31 @@ def count_face_vectors(name: str) -> int:
     data = faces_collection.get(where={"name": name})
     return len(data["ids"]) if data and data["ids"] else 0
 
+# patient_context.json is read for every face and object several times a second, and the file sits
+# on a slow Docker bind mount — keep the parsed content and re-read only when the file changes
+_context_cache = {"mtime": None, "data": None}
+
+
 def get_patient_context() -> dict:
-    if os.path.exists(CONTEXT_FILE):
+    if not os.path.exists(CONTEXT_FILE):
+        return {
+            "routines": [],
+            "reminders": [],
+            "notes": []
+        }
+    mtime = os.path.getmtime(CONTEXT_FILE)
+    if _context_cache["mtime"] != mtime:
         with open(CONTEXT_FILE, "r") as f:
-            return json.load(f)
-    return {
-        "routines": [],
-        "reminders": [],
-        "notes": []
-    }
+            _context_cache["data"] = json.load(f)
+        _context_cache["mtime"] = mtime
+    # Callers modify the result and save it back — hand out a copy so the cache stays clean
+    return copy.deepcopy(_context_cache["data"])
 
 def save_patient_context(context: dict):
     with open(CONTEXT_FILE, "w") as f:
         json.dump(context, f, indent=4)
+    _context_cache["data"] = copy.deepcopy(context)
+    _context_cache["mtime"] = os.path.getmtime(CONTEXT_FILE)
 
 def add_routine(routine: str):
     ctx = get_patient_context()
@@ -166,6 +179,15 @@ def build_context_string() -> str:
         lines.append("\nNotes:")
         for n in ctx["notes"]:
             lines.append(f"- {n}")
+
+    # Known people — lets voice commands like "remember that Dimka told me..." name the right person
+    people = list_faces()
+    if people:
+        lines.append("\nKnown people:")
+        for p in people:
+            topics = p.get("topics") or []
+            last = f" — last talked about: {topics[-1]}" if topics else ""
+            lines.append(f"- {p['name']} ({p.get('relation', '')}){last}")
 
     objects = ctx.get("objects", [])
     if objects:

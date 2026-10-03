@@ -1,15 +1,15 @@
-# RemindMe: AI Memory Companion
+# Kinly: AI Memory Companion
 
 <p align="center">
-  <img src="media/ui.jpg" alt="RemindMe — Ambient Mode" width="75%">
+  <img src="media/ui.jpg" alt="Kinly — Ambient Mode" width="75%">
   &nbsp;&nbsp;
 </p>
 <p align="center">
-  <img src="media/ui2.jpg" alt="RemindMe — Command Mode" width="25%">
-  <img src="media/ui3.jpg" alt="RemindMe — Ambient Mode" width="28%">
+  <img src="media/ui2.jpg" alt="Kinly — Command Mode" width="25%">
+  <img src="media/ui3.jpg" alt="Kinly — Ambient Mode" width="28%">
 </p>
 
-RemindMe is an ambient AI memory companion designed for smart glasses that supports people with Alzheimer's and cognitive decline. It watches, listens, and remembers — activating only when the user says **"Remind me."**
+Kinly is an ambient AI memory companion designed for smart glasses that supports people with Alzheimer's and cognitive decline. It watches, listens, and remembers — activating only when the user says **"Hey Kinly"**
 
 ---
 
@@ -19,13 +19,13 @@ Over 55 million people worldwide live with dementia. They forget faces of loved 
 
 ## What It Does
 
-RemindMe runs passively on smart glasses (or any webcam device) in two modes:
+Kinly runs passively on smart glasses (or any webcam device) in two modes:
 
 **Ambient Mode** — always on, invisible:
 - Recognizes faces and shows names + last conversation topic
 - Detects registered personal objects with metadata overlays (name, dosage, schedule)
 - Logs environmental context every 30 seconds
-- Listens for the "Remind me" hotword offline
+- Listens offline for the wake phrase "Hey Kinly" (or "Remind me")
 
 **Command Mode** — triggered by voice:
 - User speaks naturally: *"Remember this is my blood pressure medication, I take it every morning"*
@@ -90,7 +90,7 @@ Smart Glasses / Webcam
 | Face Detection | DeepFace + MTCNN | — | 50px min face | Detect faces in frames |
 | Face Embedding | Facenet512 | 512-dim | 0.40 cosine | Identify known people |
 | Voice Embedding | ECAPA-TDNN (SpeechBrain) | 192-dim | 0.25 cosine | Identify speakers |
-| Hotword Detection | Faster-Whisper (small, int8) | — | substring match | Detect "remind me" offline |
+| Hotword Detection | Faster-Whisper (small, int8) | — | phrase match + "Kinly" hint | Detect "Hey Kinly" / "Remind me" offline |
 | Object Detection | YOLOv11 | — | 0.1 confidence | Detect objects in frames |
 | Object Embedding | DINOv2-Small (Meta) | 384-dim | 0.30 cosine | Match personal objects |
 | Command Processing | Gemini 3.1 Flash-Lite | — | structured JSON | Understand audio + vision |
@@ -105,7 +105,7 @@ Smart Glasses / Webcam
 2. **Face Loop** — DeepFace extracts embeddings → ChromaDB top-5 query → majority voting → green overlay with name
 3. **Object Loop** — YOLO detects objects every ~5s → DINOv2 embeddings → ChromaDB match → blue overlay with metadata
 4. **Context Loop** — Every 30s, Gemini summarizes the current environment → stored in session memory
-5. **Hotword Trigger** — Whisper detects "remind me" → backend sends `STATE_CHANGE` → frontend enters Command Mode
+5. **Hotword Trigger** — Whisper detects "Hey Kinly" (or "Remind me") → backend sends `STATE_CHANGE` → frontend enters Command Mode
 6. **Command Mode** — Continuous audio recording, glow animation synced to voice, YOLO preview of central object
 7. **Execution** — User taps screen → raw audio + frame sent to Gemini → structured action returned (add_note, set_reminder, recognize_object, retrieve_memory, respond)
 8. **Object Registration** — If action is `recognize_object`: crop → 5 augmented DINOv2 embeddings → ChromaDB + metadata saved
@@ -165,7 +165,7 @@ GEMINI_API_KEY=your-gemini-api-key
 ## Project Structure
 
 ```
-remind-me/
+kinly/
 ├── backend/
 │   ├── main.py                 # FastAPI WebSocket server & mode orchestration
 │   ├── llm_orchestrator.py     # Gemini command processing & context injection

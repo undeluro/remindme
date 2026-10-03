@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import Webcam from 'react-webcam';
 import { CommandBar, TopBar } from './components/CommandBar';
 import DatabasePanel from './components/DatabasePanel';
+import KinlyLogo from './components/KinlyLogo';
 import './index.css';
 
 const CAMERA_CONSTRAINTS = {
@@ -13,15 +14,27 @@ const CAMERA_CONSTRAINTS = {
 };
 
 const STREAM_FRAME_SIZE = { width: 960, height: 540 };
+// How often a camera frame is sent for face recognition (~0.12 s per frame on the backend)
+const FRAME_INTERVAL_MS = 300;
+// Length of each audio chunk checked for "Hey Kinly". Shorter = Command Mode opens sooner; a phrase
+// split between two chunks is still caught (the backend checks each chunk together with the previous one)
+const HOTWORD_CHUNK_MS = 1500;
 const CHAT_LIFETIME_MS = 10000; // keep in sync with the chat-fade-out delay in index.css
 // Command mode focus area in % of the frame — keep in sync with CENTER_ZONE in backend/object_processor.py
 const CENTER_ZONE_BOX = { x: 25, y: 15, w: 50, h: 70 };
 
 // Saving an object: photos taken while the user slowly turns it
-const CAPTURE_MS = 3000;
-const CAPTURE_INTERVAL_MS = 500;
+const CAPTURE_SIDES = 3;          // photos, one per side of the object
+const CAPTURE_STEP_SECONDS = 2;   // countdown before each photo, so there's time to turn the object
+const CAPTURE_SIDE_HINTS = [
+  'Show the front of the object',
+  'Turn it to another side',
+  'Turn it once more',
+];
 const API_BASE = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000';
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// Categories that get Dosage and Schedule fields in the save panel
+const DOSAGE_CATEGORIES = ['medicine', 'supplement'];
 const REGISTRATION_FRAME_SIZE = { width: 1280, height: 720 };
 
 function App() {
@@ -31,6 +44,27 @@ function App() {
   const [trackedFaces, setTrackedFaces] = useState([]);
   const [chatLogs, setChatLogs] = useState([]);
   const [yoloDebug, setYoloDebug] = useState(false);
+  // Automatic conversation topics (Settings) — remembered in this browser, on by default
+  const [autoTopics, setAutoTopics] = useState(() => {
+    try {
+      return localStorage.getItem('kinly.autoTopics') !== 'off';
+    } catch {
+      return true;
+    }
+  });
+  const autoTopicsRef = useRef(autoTopics);  // read by the WebSocket handlers, which outlive renders
+
+  useEffect(() => {
+    autoTopicsRef.current = autoTopics;
+    try {
+      localStorage.setItem('kinly.autoTopics', autoTopics ? 'on' : 'off');
+    } catch {
+      // storage unavailable (private mode) — the setting just isn't remembered
+    }
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'AUTO_TOPICS', enabled: autoTopics }));
+    }
+  }, [autoTopics]);
 
   // Right Panels State
   const [isAddingPerson, setIsAddingPerson] = useState(false);
@@ -42,8 +76,11 @@ function App() {
   // Object recognition state
   const [recognizedObjects, setRecognizedObjects] = useState([]);
   const [objectConfirmData, setObjectConfirmData] = useState(null);
-  const [captureCountdown, setCaptureCountdown] = useState(null);  // seconds left while photographing an object
+  const [captureStep, setCaptureStep] = useState(null);  // {side, seconds, shots} while photographing an object
+  const [captureFlash, setCaptureFlash] = useState(0);   // bumped on every photo to replay the flash
   const captureRunningRef = useRef(false);
+  const captureAbortRef = useRef(false);
+  const recognizedObjectsRef = useRef([]);  // latest object boxes, readable inside the async capture loop
 
   const webcamRef = useRef(null);
   const wsRef = useRef(null);
@@ -86,6 +123,8 @@ function App() {
 
     ws.onopen = () => {
       console.log('Connected to companion backend');
+      // The backend keeps settings per connection — send the saved choice on every (re)connect
+      ws.send(JSON.stringify({ type: 'AUTO_TOPICS', enabled: autoTopicsRef.current }));
     };
 
     ws.onerror = (e) => {
@@ -117,12 +156,12 @@ function App() {
           // Clear any previous staleness timer
           if (objectTimeoutRef.current) clearTimeout(objectTimeoutRef.current);
           setRecognizedObjects(data.objects || []);
+          recognizedObjectsRef.current = data.objects || [];
           // Auto-clear overlays if no update arrives within 6 seconds
           objectTimeoutRef.current = setTimeout(() => setRecognizedObjects([]), 6000);
         } else if (data.type === 'OBJECT_CONFIRM') {
           // Voice command "remember this ..." — photograph it the same way as the "+ Save" button
           captureObject(data.object_box, {
-            firstFrame: data.frame_b64,
             suggested_name: data.suggested_name,
             note_text: data.note_text,
             detector_class: data.detector_class,
@@ -155,7 +194,7 @@ function App() {
           }));
         }
       }
-    }, 1500); // 2 FPS for smoother face tracking
+    }, FRAME_INTERVAL_MS); // backend always processes only the newest frame, so this never builds a backlog
 
     return () => clearInterval(frameInterval);
   }, []);
@@ -171,12 +210,13 @@ function App() {
     setIsDatabaseOpen(false);
   };
 
-  // Save an object: photograph it for CAPTURE_MS while the user slowly turns it, then let the
-  // backend crop it in every photo and read its label, and open the save panel with the result.
+  // Save an object: guide the user through photographing CAPTURE_SIDES sides of it (a countdown per
+  // side), then let the backend crop it in every photo and read its label, and open the save panel.
   // `box` is where the object is (% of the frame); `extras` pre-fills the panel (voice command).
   const captureObject = async (box, extras = {}) => {
     if (!webcamRef.current || captureRunningRef.current) return;
     captureRunningRef.current = true;
+    captureAbortRef.current = false;
 
     // Stop the command recording without sending it to Gemini
     cancelCommandRef.current = true;
@@ -187,15 +227,29 @@ function App() {
     setIsDatabaseOpen(false);
     setIsAddingPerson(false);
 
-    const frames = extras.firstFrame ? [extras.firstFrame] : [];
-    const shotCount = Math.round(CAPTURE_MS / CAPTURE_INTERVAL_MS);
-    for (let i = 0; i < shotCount; i++) {
-      setCaptureCountdown(Math.ceil(((shotCount - i) * CAPTURE_INTERVAL_MS) / 1000));
+    const frames = [];
+    const hintBoxes = [];
+    for (let side = 1; side <= CAPTURE_SIDES; side++) {
+      for (let seconds = CAPTURE_STEP_SECONDS; seconds > 0; seconds--) {
+        setCaptureStep({ side, seconds, shots: side - 1 });
+        await sleep(1000);
+        if (captureAbortRef.current) break;
+      }
+      if (captureAbortRef.current) break;
       const shot = webcamRef.current && webcamRef.current.getScreenshot(REGISTRATION_FRAME_SIZE);
-      if (shot) frames.push(shot.split(',')[1]);
-      await sleep(CAPTURE_INTERVAL_MS);
+      if (shot) {
+        frames.push(shot.split(',')[1]);
+        // Where the object is now — it moves when turned, so each photo gets its own box
+        const target = recognizedObjectsRef.current.find(o => o.targeted);
+        hintBoxes.push(target ? { x: target.x, y: target.y, w: target.w, h: target.h } : box);
+        setCaptureFlash(n => n + 1);
+      }
     }
-    setCaptureCountdown(null);
+    setCaptureStep(null);
+    if (captureAbortRef.current) {  // "Cancel command" pressed during the countdown
+      captureRunningRef.current = false;
+      return;
+    }
 
     // Back to ambient mode while the user fills in the panel
     setCommandMode(false);
@@ -214,11 +268,19 @@ function App() {
       const response = await fetch(`${API_BASE}/api/objects/prepare`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ frames, hint_box: box }),
+        body: JSON.stringify({ frames, hint_box: box, hint_boxes: hintBoxes }),
       });
       const data = await response.json();
       if (data.success) {
-        setObjectConfirmData({ ...panel, loading: false, shots: data.shots, label: data.label || {} });
+        const label = data.label || {};
+        setObjectConfirmData({
+          ...panel,
+          loading: false,
+          shots: data.shots,
+          label,
+          // A dosage printed on the package means it's almost certainly medicine
+          category: label.dosage ? 'medicine' : '',
+        });
       } else {
         setObjectConfirmData(null);
         addChatLog('system', data.error || 'Could not find the object in the photos');
@@ -318,14 +380,14 @@ function App() {
 
               commandRecorderRef.current.start();
             }
-            return; // Skip the ambient 2.5s chunk logic
+            return; // Skip the ambient chunk logic
           } else {
             if (commandRecorderRef.current && commandRecorderRef.current.state !== 'inactive') {
               commandRecorderRef.current.stop();
             }
           }
 
-          // AMBIENT MODE: 2.5s chunking for hotword detection
+          // AMBIENT MODE: short chunks (HOTWORD_CHUNK_MS) for "Hey Kinly" detection
           const mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
           const chunks = [];
 
@@ -348,10 +410,10 @@ function App() {
           mediaRecorder.start();
           setTimeout(() => {
             if (mediaRecorder.state !== 'inactive') mediaRecorder.stop();
-          }, 2500);
+          }, HOTWORD_CHUNK_MS);
         };
 
-        recordingInterval = setInterval(startRecordingChunk, 2500);
+        recordingInterval = setInterval(startRecordingChunk, HOTWORD_CHUNK_MS);
       } catch (e) {
         console.error("Audio capture failed", e);
       }
@@ -370,7 +432,7 @@ function App() {
   return (
     <div className={`app-container ${commandMode ? 'command-mode' : ''}`}>
       {commandMode && <div className="glow-container"></div>}
-      <div className="app-title">RemindMe</div>
+      <KinlyLogo />
       <TopBar
         onOpenSettings={() => { setIsSettingsOpen(true); setIsDatabaseOpen(false); setIsAddingPerson(false); }}
         onOpenDatabase={() => { setIsDatabaseOpen(true); setIsSettingsOpen(false); setIsAddingPerson(false); }}
@@ -383,6 +445,7 @@ function App() {
             e.stopPropagation(); // prevent clicking the webcam
             setCommandMode(false);
             cancelCommandRef.current = true;
+            captureAbortRef.current = true;  // also stops photographing an object, if that's running
             if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
               wsRef.current.send(JSON.stringify({ type: 'COMMAND', command: 'END_COMMAND' }));
             }
@@ -395,13 +458,13 @@ function App() {
         </button>
       )}
 
-      {commandMode && <div className="click-to-send-text">Click screen to send</div>}
+      {commandMode && captureStep === null && <div className="click-to-send-text">Click screen to send</div>}
 
       <div
         className="webcam-wrapper"
-        style={{ cursor: commandMode ? 'pointer' : 'default' }}
+        style={{ cursor: commandMode && captureStep === null ? 'pointer' : 'default' }}
         onClick={() => {
-          if (commandMode) {
+          if (commandMode && !captureRunningRef.current) {
             setCommandMode(false);
             if (commandRecorderRef.current && commandRecorderRef.current.state !== 'inactive') {
               commandRecorderRef.current.stop();  // onstop sends the command; backend returns to AMBIENT after it
@@ -428,7 +491,7 @@ function App() {
         {commandMode && (
           <div className="center-zone">
             {/* Fallback when the detector can't find the object: save whatever is inside the frame */}
-            {!recognizedObjects.some(o => o.targeted) && captureCountdown === null && (
+            {!recognizedObjects.some(o => o.targeted) && captureStep === null && (
               <button
                 className="tag-add-btn center-zone-save"
                 onClick={(e) => { e.stopPropagation(); captureObject(CENTER_ZONE_BOX); }}
@@ -439,11 +502,21 @@ function App() {
           </div>
         )}
 
-        {captureCountdown !== null && (
+        {captureStep !== null && (
           <div className="capture-overlay">
-            Slowly turn the object… {captureCountdown}
+            <div className="capture-step">Side {captureStep.side} of {CAPTURE_SIDES}</div>
+            <div className="capture-hint">{CAPTURE_SIDE_HINTS[captureStep.side - 1]}</div>
+            <div className="capture-count">{captureStep.seconds}</div>
+            <div className="capture-dots">
+              {Array.from({ length: CAPTURE_SIDES }, (_, i) => (
+                <span key={i} className={`capture-dot ${i < captureStep.shots ? 'done' : ''}`}></span>
+              ))}
+            </div>
           </div>
         )}
+
+        {/* Brief white flash each time a photo is taken (key change replays the animation) */}
+        {captureFlash > 0 && <div key={captureFlash} className="capture-flash"></div>}
 
         {/* Chat / Logs Window Overlay */}
         <div className="chat-window">
@@ -459,11 +532,19 @@ function App() {
           <div className="right-panel">
             <h3>Settings</h3>
             <p>Configure application preferences, UI tokens, and API endpoints.</p>
-            <div style={{ marginTop: '20px', marginBottom: '20px' }}>
+            <div style={{ marginTop: '20px', marginBottom: '20px', display: 'flex', flexDirection: 'column', gap: '14px' }}>
               <label style={{ display: 'flex', alignItems: 'center', gap: '10px', cursor: 'pointer' }}>
-                <input 
-                  type="checkbox" 
-                  checked={yoloDebug} 
+                <input
+                  type="checkbox"
+                  checked={autoTopics}
+                  onChange={(e) => setAutoTopics(e.target.checked)}
+                />
+                Save conversation topics automatically (audio of conversations with known people is summarized by Gemini)
+              </label>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '10px', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={yoloDebug}
                   onChange={(e) => {
                     const enabled = e.target.checked;
                     setYoloDebug(enabled);
@@ -567,9 +648,10 @@ function App() {
               const name = e.target.obj_name.value;
               const notes = e.target.obj_notes.value;
               const category = e.target.obj_category.value;
-              const dosage = e.target.obj_dosage.value;
-              const schedule = e.target.obj_schedule.value;
-              const labelText = e.target.obj_label.value.trim();
+              // These fields only exist for medicine/supplements and objects with readable text
+              const dosage = e.target.obj_dosage ? e.target.obj_dosage.value : '';
+              const schedule = e.target.obj_schedule ? e.target.obj_schedule.value : '';
+              const labelText = e.target.obj_label ? e.target.obj_label.value.trim() : '';
               if (!name) return;
               const label = objectConfirmData.label || {};
               // If the user cleared the label text, don't use the label to recognize this object
@@ -594,7 +676,7 @@ function App() {
                 });
                 const data = await response.json();
                 if (data.success) {
-                  addChatLog("system", `Zapamiętałem: ${name} — ${notes}`);
+                  addChatLog("system", `Saved: ${name}${notes ? ` — ${notes}` : ""}`);
                   setObjectConfirmData(null);
                   // Signal backend to return to AMBIENT mode
                   if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
@@ -607,13 +689,21 @@ function App() {
                 alert("Failed to save object");
               }
             }}>
-              <label>Text on the object (read automatically)</label>
-              <input
-                type="text"
-                name="obj_label"
-                placeholder="Nothing readable — hold the label closer"
-                defaultValue={(objectConfirmData.label || {}).text || ''}
-              />
+              {((objectConfirmData.label || {}).text || (objectConfirmData.label || {}).error) && (
+                <>
+                  <label>
+                    {objectConfirmData.label.error
+                      ? "Text on the object (couldn't read it — AI is busy, type it if there is any)"
+                      : 'Text on the object (read automatically)'}
+                  </label>
+                  <input
+                    type="text"
+                    name="obj_label"
+                    placeholder={objectConfirmData.label.error ? 'e.g. Ibuprom 200 mg' : 'Clear it to not use the text for recognition'}
+                    defaultValue={objectConfirmData.label.text || ''}
+                  />
+                </>
+              )}
               <label>Name</label>
               <input
                 type="text"
@@ -625,7 +715,14 @@ function App() {
               <label>Note</label>
               <input type="text" name="obj_notes" placeholder="e.g. Take 3 times a day" defaultValue={objectConfirmData.note_text || ''} />
               <label>Category</label>
-              <select name="obj_category" defaultValue={(objectConfirmData.label || {}).dosage ? 'medicine' : ''}>
+              <select
+                name="obj_category"
+                value={objectConfirmData.category || ''}
+                onChange={(e) => {
+                  const category = e.target.value;
+                  setObjectConfirmData(prev => ({ ...prev, category }));
+                }}
+              >
                 <option value="">— Select —</option>
                 <option value="medicine">Medicine</option>
                 <option value="supplement">Supplement</option>
@@ -633,19 +730,23 @@ function App() {
                 <option value="food">Food</option>
                 <option value="other">Other</option>
               </select>
-              <label>Dosage</label>
-              <input type="text" name="obj_dosage" placeholder="e.g. 500mg" defaultValue={(objectConfirmData.label || {}).dosage || ''} />
-              <label>Schedule</label>
-              <input type="text" name="obj_schedule" placeholder="e.g. 3x daily after meals" />
+              {DOSAGE_CATEGORIES.includes(objectConfirmData.category) && (
+                <>
+                  <label>Dosage</label>
+                  <input type="text" name="obj_dosage" placeholder="e.g. 500mg" defaultValue={(objectConfirmData.label || {}).dosage || ''} />
+                  <label>Schedule</label>
+                  <input type="text" name="obj_schedule" placeholder="e.g. 3x daily after meals" />
+                </>
+              )}
               <div className="panel-actions">
-                <button type="submit" className="submit-btn btn-primary">Zatwierdź</button>
+                <button type="submit" className="submit-btn btn-primary">Save</button>
                 <button type="button" className="cancel-btn btn-secondary" onClick={() => {
                   setObjectConfirmData(null);
                   // Signal backend to return to AMBIENT mode
                   if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
                     wsRef.current.send(JSON.stringify({ type: 'COMMAND', command: 'OBJECT_CONFIRM_DONE' }));
                   }
-                }}>Anuluj</button>
+                }}>Cancel</button>
               </div>
             </form>
           </div>
@@ -673,16 +774,17 @@ function App() {
               </svg>
               <div className={`face-tooltip ${isUnknown ? 'unknown' : ''}`}>
                 <div className="face-name">{face.name}</div>
-                <div className="face-relation">{face.relation}</div>
+                {face.relation && <div className="face-relation">{face.relation}</div>}
+                {/* Nothing is shown until there has been a conversation with this person */}
                 {face.topics && face.topics.length > 0 ? (
                   <div className="face-topics-list">
                     {face.topics.map((t, i) => (
                       <span key={i} className="face-topic-tag">{t}</span>
                     ))}
                   </div>
-                ) : (
+                ) : face.lastConversation ? (
                   <div className="face-topic">Last Topic: {face.lastConversation}</div>
-                )}
+                ) : null}
                 {isUnknown && (
                   <button
                     className="tag-add-btn"
@@ -712,8 +814,7 @@ function App() {
               <div className="object-name">{obj.name}</div>
               {obj.notes && <div className="object-notes">{obj.notes}</div>}
               {obj.dosage && <div className="object-meta">Dosage: {obj.dosage}</div>}
-              {obj.label && <div className="object-meta">Label: {obj.label}</div>}
-              {obj.targeted && captureCountdown === null && (
+              {obj.targeted && captureStep === null && (
                 <button
                   className="tag-add-btn"
                   onClick={(e) => {

@@ -97,6 +97,8 @@ def resolve_by_label(candidates: list[str], reading: dict) -> tuple[str | None, 
     """
     if not candidates:
         return None, False
+    if reading.get("error"):
+        return None, False  # the read failed — unknown is not "no text", never fall back to looks alone
     if not any(reading.get(k) for k in ("text", "product_name", "dosage")):
         return candidates[0], True  # nothing readable — trust appearance
 
@@ -490,16 +492,21 @@ class ObjectProcessor:
 
         return keep
 
-    def prepare_shots(self, frames_b64: list[str], hint_box: dict | None) -> list[dict]:
+    def prepare_shots(self, frames_b64: list[str], hint_box: dict | None,
+                      hint_boxes: list[dict | None] | None = None) -> list[dict]:
         """Find and crop the object in each of several frames (taken while the user turns it).
 
         The object moves between frames, so it is re-detected in every frame. With a hint_box, only
         detections centred inside it (enlarged a bit for movement) and overlapping it well count —
         otherwise hint_box itself is used, never some other object. Without a hint, the most central one.
+        hint_boxes optionally gives a box per frame (where the object was when that photo was taken),
+        overriding hint_box for that frame.
         Returns [{"crop_b64", "box"}] with box in % of the frame.
         """
         shots = []
-        for frame_b64 in frames_b64:
+        default_hint = hint_box
+        for i, frame_b64 in enumerate(frames_b64):
+            hint_box = (hint_boxes[i] if hint_boxes and i < len(hint_boxes) else None) or default_hint
             img = self._decode_frame(frame_b64)
             if img is None:
                 continue

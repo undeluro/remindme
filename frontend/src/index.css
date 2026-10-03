@@ -14,6 +14,9 @@
   position: absolute;
   top: 24px;
   left: 24px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
   font-family: 'Outfit', sans-serif;
   font-size: 28px;
   font-weight: 700;
@@ -21,6 +24,20 @@
   z-index: 10;
   text-shadow: 0 2px 4px rgba(0, 0, 0, 0.5);
   letter-spacing: -0.5px;
+}
+
+/* Glasses mark — drop-shadow keeps it readable over any camera picture, like the text-shadow above */
+.kinly-mark {
+  flex-shrink: 0;
+  filter: drop-shadow(0 2px 3px rgba(0, 0, 0, 0.5));
+}
+
+.kinly-accent {
+  fill: var(--primary-color);
+}
+
+.kinly-wordmark {
+  line-height: 1;
 }
 
 .glow-container {
@@ -172,10 +189,10 @@ body {
 .face-anchor {
   position: absolute;
   pointer-events: none;
-  transition: top 0.8s cubic-bezier(0.2, 0.8, 0.2, 1),
-    left 0.8s cubic-bezier(0.2, 0.8, 0.2, 1),
-    width 0.8s cubic-bezier(0.2, 0.8, 0.2, 1),
-    height 0.8s cubic-bezier(0.2, 0.8, 0.2, 1),
+  transition: top 0.25s ease-out,
+    left 0.25s ease-out,
+    width 0.25s ease-out,
+    height 0.25s ease-out,
     opacity 1.5s ease;
 }
 
@@ -455,19 +472,75 @@ body {
   animation: chat-slide-in 0.3s ease-out;
 }
 
-/* Shown while photographing an object for ~3 seconds */
+/* Guided photographing of an object: one countdown per side, centred on screen */
 .capture-overlay {
   position: absolute;
-  top: 8%;
+  top: 50%;
   left: 50%;
-  transform: translateX(-50%);
-  padding: 12px 24px;
-  border-radius: 30px;
-  background: rgba(30, 60, 114, 0.85);
+  transform: translate(-50%, -50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 20px 32px;
+  border-radius: 24px;
+  background: rgba(30, 60, 114, 0.55);
+  backdrop-filter: blur(4px);
   color: #fff;
-  font-size: 18px;
-  font-weight: 600;
+  text-align: center;
   pointer-events: none;
+  z-index: 15;
+}
+
+.capture-step {
+  font-size: 14px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  opacity: 0.85;
+}
+
+.capture-hint {
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.capture-count {
+  font-size: 96px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.capture-dots {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.capture-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid #fff;
+}
+
+.capture-dot.done {
+  background: #fff;
+}
+
+/* Camera-shutter flash when a photo is taken */
+.capture-flash {
+  position: absolute;
+  inset: 0;
+  background: #fff;
+  pointer-events: none;
+  z-index: 16;
+  animation: capture-flash 0.4s ease-out forwards;
+}
+
+@keyframes capture-flash {
+  from { opacity: 0.7; }
+  to { opacity: 0; }
 }
 
 /* Photos of an object in the save panel */
@@ -503,9 +576,10 @@ body {
   cursor: pointer;
 }
 
+/* Top of the frame — the "Cancel command" button sits near the bottom of the screen */
 .center-zone-save {
   position: absolute;
-  bottom: 16px;
+  top: 16px;
   left: 50%;
   transform: translateX(-50%);
   white-space: nowrap;
@@ -838,10 +912,10 @@ body {
   pointer-events: none;
   border: 2px solid rgba(100, 149, 237, 0.7);
   border-radius: 8px;
-  transition: top 0.8s cubic-bezier(0.2, 0.8, 0.2, 1),
-    left 0.8s cubic-bezier(0.2, 0.8, 0.2, 1),
-    width 0.8s cubic-bezier(0.2, 0.8, 0.2, 1),
-    height 0.8s cubic-bezier(0.2, 0.8, 0.2, 1);
+  transition: top 0.25s ease-out,
+    left 0.25s ease-out,
+    width 0.25s ease-out,
+    height 0.25s ease-out;
   box-shadow: 0 0 12px rgba(100, 149, 237, 0.25);
   animation: object-fade-in 0.4s ease-out;
 }
