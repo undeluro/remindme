@@ -38,6 +38,29 @@ class CommandAction(BaseModel):
     )
 
 
+class SceneUpdate(BaseModel):
+    """Structured output for the ambient context check."""
+    changed: bool = Field(
+        description="True only if the surroundings meaningfully changed compared to the previous description."
+    )
+    description: str = Field(
+        "", description="One short sentence describing the current surroundings, if changed."
+    )
+
+
+class LabelReading(BaseModel):
+    """Structured output for reading the printed text on an object (e.g. a medicine box)."""
+    text: str = Field(
+        "", description="All clearly readable printed text on the object, as written. Empty if nothing is readable."
+    )
+    product_name: str = Field(
+        "", description="The product or medicine name (brand name), if there is one. Empty otherwise."
+    )
+    dosage: str = Field(
+        "", description="Strength/dosage printed on it, e.g. '200 mg' or '500 mg/5 ml'. Empty if none."
+    )
+
+
 class LLMOrchestrator:
     def __init__(self, ws_send_callback):
         self.ws_send_callback = ws_send_callback
@@ -104,19 +127,66 @@ When the user mentions wanting to remember, save, or recognize an object/item/th
             print(f"Error processing command: {e}")
             return {"action": "respond", "spoken_response": f"Sorry, I had trouble understanding that. ({e})"}
 
-    async def generate_ambient_summary(self, base64_image: str) -> str:
+    async def read_label(self, images_jpeg: list[bytes]) -> dict:
+        """Read the printed text on an object from one or more photos of it (different angles).
+
+        Returns {"text", "product_name", "dosage"} — all empty when nothing is readable or Gemini is unavailable.
+        """
+        empty = {"text": "", "product_name": "", "dosage": ""}
+        if not self.client or not images_jpeg:
+            return empty
+        try:
+            parts = [types.Part.from_bytes(data=img, mime_type="image/jpeg") for img in images_jpeg]
+            parts.append(
+                "These photos show the same object from different angles. Read the printed text on it "
+                "(for medicine: the name and the strength). Only report text you can actually read — never guess."
+            )
+            response = await self.client.aio.models.generate_content(
+                model="gemini-3.1-flash-lite-preview",
+                contents=parts,
+                config={
+                    "response_mime_type": "application/json",
+                    "response_json_schema": LabelReading.model_json_schema(),
+                }
+            )
+            reading = LabelReading.model_validate_json(response.text)
+            print(f"[LLM] Label read: {reading.model_dump()}")
+            return reading.model_dump()
+        except Exception as e:
+            print(f"Error reading label: {e}")
+            return empty
+
+    async def generate_ambient_summary(self, base64_image: str, previous_summary: str = "") -> str:
+        """Describe the surroundings, or return "" when nothing meaningful changed since previous_summary."""
         if not self.client:
             return ""
         try:
             image_bytes = base64.b64decode(base64_image)
+            if previous_summary:
+                prompt = (
+                    f'Previous description of the patient\'s surroundings: "{previous_summary}"\n'
+                    "Look at the new image. Set changed=true only if something meaningful changed: "
+                    "a different place or room, people arriving or leaving, or a different activity. "
+                    "Camera movement, lighting, posture or small differences do NOT count. "
+                    "If changed, describe the new surroundings in 1 short sentence."
+                )
+            else:
+                prompt = "Describe the patient's surroundings in 1 short sentence. Set changed=true."
             response = await self.client.aio.models.generate_content(
                 model="gemini-3.1-flash-lite-preview",
                 contents=[
                     types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                    "Describe the patient's surroundings in 1 short sentence."
-                ]
+                    prompt
+                ],
+                config={
+                    "response_mime_type": "application/json",
+                    "response_json_schema": SceneUpdate.model_json_schema(),
+                }
             )
-            return response.text
+            result = SceneUpdate.model_validate_json(response.text)
+            if not result.changed:
+                return ""
+            return result.description.strip()
         except Exception as e:
             print(f"Error generating ambient summary: {e}")
             return ""

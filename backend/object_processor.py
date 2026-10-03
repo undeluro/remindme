@@ -1,6 +1,9 @@
 import cv2
 import base64
 import io
+import re
+import threading
+from difflib import SequenceMatcher
 import numpy as np
 import torch
 from transformers import AutoImageProcessor, AutoModel
@@ -8,10 +11,106 @@ from PIL import Image
 from ultralytics import YOLO
 import db
 
+# YOLOE detects whatever words it is given (open vocabulary), unlike plain YOLO's fixed 80 COCO classes
+DETECTOR_WEIGHTS = "yoloe-26s-seg.pt"
+DETECTOR_IMGSZ = 640
+# Household things worth remembering. The detector type of every saved object is added on top.
+# "person" is included only so people are labelled as people and then skipped, not mistaken for objects.
+BASE_VOCABULARY = [
+    "person", "cell phone", "cup", "mug", "bottle", "drink can", "glasses", "sunglasses", "keys", "wallet",
+    "pillow", "cushion", "blanket", "remote control", "laptop", "book", "notebook", "pen",
+    "bag", "backpack", "handbag", "hat", "shoe", "slipper", "watch", "medicine box", "pill bottle",
+    "blister pack", "toothbrush", "comb", "plate", "bowl", "spoon", "fork", "knife", "scissors",
+    "headphones", "charger", "toy", "teddy bear", "plush toy", "umbrella", "clock", "lamp",
+    "plant", "vase", "photo frame", "box",
+]
+
 CONFIDENCE_THRESHOLD = 0.4  # Lowered to 0.4 to pick up smaller objects
-PERSON_CLASS_ID = 0  # COCO class 0 = person
+COMMAND_CONFIDENCE_THRESHOLD = 0.25  # Command mode: the user is deliberately showing something, so accept weaker detections
+MAX_AMBIENT_CANDIDATES = 6  # Ambient mode: only compare the largest detections with saved objects
 NMS_IOU_THRESHOLD = 0.5  # IoU threshold for deduplicating YOLO detections
 MATCH_IOU_THRESHOLD = 0.3  # IoU threshold for deduplicating matched objects
+
+# Command mode only looks at things in the middle of the frame (fractions of width/height).
+# Keep in sync with .center-zone in frontend/src/index.css
+CENTER_ZONE = (0.25, 0.15, 0.75, 0.85)  # x1, y1, x2, y2
+
+
+def in_center_zone(x_pct: float, y_pct: float, w_pct: float, h_pct: float) -> bool:
+    """True if the center of a box (given in % of the frame) lies inside CENTER_ZONE."""
+    cx = (x_pct + w_pct / 2) / 100
+    cy = (y_pct + h_pct / 2) / 100
+    x1, y1, x2, y2 = CENTER_ZONE
+    return x1 <= cx <= x2 and y1 <= cy <= y2
+
+
+LABEL_MATCH_MIN = 0.6  # how well the read text must match a saved label to count as that object
+SHOT_HINT_MARGIN = 0.25  # saving: the object may move this much (fraction of its size) between photos
+SHOT_MIN_IOU = 0.3  # saving: a detection must overlap the object's last known box this much to be used
+
+
+def object_payload(name: str) -> dict:
+    """What the frontend tag shows for a saved object."""
+    info = db.get_object_info(name) or {}
+    label = " ".join(p for p in (info.get("label_name", ""), info.get("label_dosage", "")) if p)
+    return {
+        "name": name,
+        "notes": info.get("notes", ""),
+        "dosage": info.get("dosage", ""),
+        "category": info.get("category", ""),
+        "label": label,
+    }
+
+
+def _label_tokens(text: str) -> list[str]:
+    """Meaningful words/numbers of a label: lowercase, letters+digits only, no 1-2 letter noise."""
+    tokens = re.findall(r"[^\W_]+", (text or "").lower())
+    return [t for t in tokens if len(t) >= 3 or t.isdigit()]
+
+
+def label_match_score(saved: dict, reading: dict) -> float:
+    """0..1 — how well a freshly read label matches the label saved with an object.
+
+    Scored on the saved product name + dosage (falling back to its full text), each word
+    fuzzily matched against the words just read, so small OCR slips don't matter.
+    """
+    key = " ".join(p for p in (saved.get("label_name", ""), saved.get("label_dosage", "")) if p) or saved.get("label_text", "")
+    key_tokens = _label_tokens(key)
+    read_tokens = _label_tokens(" ".join(reading.get(k, "") for k in ("text", "product_name", "dosage")))
+    if not key_tokens or not read_tokens:
+        return 0.0
+    total = 0.0
+    for kt in key_tokens:
+        best = max(SequenceMatcher(None, kt, rt).ratio() for rt in read_tokens)
+        # numbers (dosages) must match exactly — 200 mg is not 400 mg
+        total += (1.0 if kt in read_tokens else 0.0) if kt.isdigit() else best
+    return total / len(key_tokens)
+
+
+def resolve_by_label(candidates: list[str], reading: dict) -> tuple[str | None, bool]:
+    """Decide between look-alike objects using the label text just read.
+
+    Returns (name, keep): the saved object whose label matches best, or the look-alike
+    winner when the text doesn't help; keep=False means the text proves it's none of
+    the saved labelled objects (e.g. a different medicine), so no tag should be shown.
+    """
+    if not candidates:
+        return None, False
+    if not any(reading.get(k) for k in ("text", "product_name", "dosage")):
+        return candidates[0], True  # nothing readable — trust appearance
+
+    infos = {name: db.get_object_info(name) or {} for name in candidates}
+    labelled = {n: i for n, i in infos.items() if i.get("label_text") or i.get("label_name")}
+    if not labelled:
+        return candidates[0], True
+
+    scores = {n: label_match_score(i, reading) for n, i in labelled.items()}
+    best_name = max(scores, key=scores.get)
+    if scores[best_name] >= LABEL_MATCH_MIN:
+        return best_name, True
+    if candidates[0] in labelled:
+        return None, False  # looks like a saved box, but the text says it's something else
+    return candidates[0], True
 
 
 def _compute_iou(box_a, box_b):
@@ -58,7 +157,11 @@ def _nms_detections(detections, iou_threshold):
 
 class ObjectProcessor:
     def __init__(self):
-        self.yolo_model = YOLO("yolo26s.pt")
+        # Inference and vocabulary updates come from different threads (object loop, save requests)
+        self._yolo_lock = threading.Lock()
+        self._dino_lock = threading.Lock()
+        self.yolo_model = YOLO(DETECTOR_WEIGHTS)
+        self.refresh_vocabulary()
 
         # Local DINOv2 model for geometric instance embeddings (384-dim)
         # Use MPS on Apple Silicon for fast inference
@@ -78,12 +181,24 @@ class ObjectProcessor:
         nparr = np.frombuffer(img_data, np.uint8)
         return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
+    def refresh_vocabulary(self):
+        """Tell the detector which words to look for: the base list plus the type of every saved object."""
+        words = list(BASE_VOCABULARY)
+        for obj in db.list_objects():
+            word = (obj.get("detector_class") or obj.get("name") or "").strip().lower()
+            if word and word not in words:
+                words.append(word)
+        with self._yolo_lock:
+            self.yolo_model.set_classes(words, self.yolo_model.get_text_pe(words))
+        print(f"[ObjectProcessor] Detector vocabulary: {len(words)} words")
+
     def _run_yolo(self, img, conf_threshold=None):
         """Run YOLO and return filtered, NMS-deduplicated detections."""
         if conf_threshold is None:
             conf_threshold = CONFIDENCE_THRESHOLD
-            
-        results = self.yolo_model(img, verbose=False, imgsz=1280)
+
+        with self._yolo_lock:
+            results = self.yolo_model(img, verbose=False, imgsz=DETECTOR_IMGSZ)
         detections = []
         if not results or len(results) == 0:
             print("[YOLO] No results returned from model")
@@ -97,7 +212,7 @@ class ObjectProcessor:
                 cls_id = int(box.cls[0])
                 conf = float(box.conf[0])
                 cls_name = self.yolo_model.names[cls_id]
-                if cls_id == PERSON_CLASS_ID:
+                if cls_name == "person":
                     continue
                 if conf < conf_threshold:
                     print(f"[YOLO] Skipped {cls_name} (conf={conf:.3f} < {conf_threshold})")
@@ -147,7 +262,7 @@ class ObjectProcessor:
         try:
             img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
             inputs = self.processor(images=img, return_tensors="pt").to(self._device)
-            with torch.no_grad():
+            with self._dino_lock, torch.no_grad():
                 outputs = self.dino_model(**inputs)
             
             # Use the CLS token representation (first token)
@@ -177,13 +292,20 @@ class ObjectProcessor:
                 embeddings.append(emb)
         return embeddings
 
+    def _central_detections(self, img) -> list[dict]:
+        """YOLO detections whose center lies inside CENTER_ZONE (command mode)."""
+        return [
+            d for d in self._run_yolo(img, conf_threshold=COMMAND_CONFIDENCE_THRESHOLD)
+            if in_center_zone(d["x_pct"], d["y_pct"], d["w_pct"], d["h_pct"])
+        ]
+
     def detect_central_object(self, frame_b64: str) -> dict | None:
         """Detect the most central object in the frame (on-demand, COMMAND mode)."""
         img = self._decode_frame(frame_b64)
         if img is None:
             return None
 
-        detections = self._run_yolo(img)
+        detections = self._central_detections(img)
         if not detections:
             return None
 
@@ -220,29 +342,30 @@ class ObjectProcessor:
             return []
         print(f"[ObjectRecog] YOLO found {len(detections)} detections, {obj_count} objects in DB")
 
+        # The bigger vocabulary finds more things — only embed the largest few to keep each scan fast
+        detections.sort(key=lambda d: d["w"] * d["h"], reverse=True)
         matched = []
-        for det in detections:
+        for det in detections[:MAX_AMBIENT_CANDIDATES]:
             crop = self._get_crop(img, det)
             img_bytes = self._crop_to_bytes(crop)
             emb = self._generate_embedding(img_bytes)
             if not emb:
                 continue
 
-            meta = db.query_object(emb)
-            if meta:
-                name = meta.get("name", "Unknown")
-                obj_info = db.get_object_info(name)
-                matched.append({
+            candidates = db.query_object_candidates(emb)
+            if candidates:
+                obj = object_payload(candidates[0]["name"])
+                obj.update({
                     "x": det["x_pct"],
                     "y": det["y_pct"],
                     "w": det["w_pct"],
                     "h": det["h_pct"],
-                    "name": name,
-                    "notes": obj_info.get("notes", "") if obj_info else "",
-                    "dosage": obj_info.get("dosage", "") if obj_info else "",
-                    "category": obj_info.get("category", "") if obj_info else "",
                     "confidence": det["confidence"],
+                    # Internal (stripped before sending): every look-alike, and the photo for reading its label
+                    "_candidates": [c["name"] for c in candidates],
+                    "_crop_jpeg": img_bytes,
                 })
+                matched.append(obj)
 
         # Deduplicate: if same name appears in overlapping boxes, keep higher confidence
         matched = self._dedup_matched(matched)
@@ -254,7 +377,7 @@ class ObjectProcessor:
         if img is None:
             return []
 
-        detections = self._run_yolo(img)
+        detections = self._central_detections(img)
         if not detections:
             return []
 
@@ -280,6 +403,7 @@ class ObjectProcessor:
             "dosage": "",
             "category": "yolo_raw",
             "confidence": best["confidence"],
+            "targeted": True,  # the frontend shows "+ Save" on this box
         }]
 
     def detect_all_yolo_debug(self, frame_b64: str) -> list[dict]:
@@ -337,10 +461,72 @@ class ObjectProcessor:
 
         return keep
 
+    def prepare_shots(self, frames_b64: list[str], hint_box: dict | None) -> list[dict]:
+        """Find and crop the object in each of several frames (taken while the user turns it).
+
+        The object moves between frames, so it is re-detected in every frame. With a hint_box, only
+        detections centred inside it (enlarged a bit for movement) and overlapping it well count —
+        otherwise hint_box itself is used, never some other object. Without a hint, the most central one.
+        Returns [{"crop_b64", "box"}] with box in % of the frame.
+        """
+        shots = []
+        for frame_b64 in frames_b64:
+            img = self._decode_frame(frame_b64)
+            if img is None:
+                continue
+            h_img, w_img = img.shape[:2]
+            detections = self._central_detections(img)
+
+            best = None
+            if hint_box:
+                hint_px = {"x": hint_box["x"] / 100 * w_img, "y": hint_box["y"] / 100 * h_img,
+                           "w": hint_box["w"] / 100 * w_img, "h": hint_box["h"] / 100 * h_img}
+                mx, my = hint_px["w"] * SHOT_HINT_MARGIN, hint_px["h"] * SHOT_HINT_MARGIN
+
+                def centred_in_hint(d):
+                    cx, cy = d["x"] + d["w"] / 2, d["y"] + d["h"] / 2
+                    return (hint_px["x"] - mx <= cx <= hint_px["x"] + hint_px["w"] + mx
+                            and hint_px["y"] - my <= cy <= hint_px["y"] + hint_px["h"] + my)
+
+                near = [d for d in detections if centred_in_hint(d) and _compute_iou(d, hint_px) >= SHOT_MIN_IOU]
+                if near:
+                    best = max(near, key=lambda d: _compute_iou(d, hint_px))
+            elif detections:
+                cx, cy = w_img / 2, h_img / 2
+                best = min(detections, key=lambda d: (d["x"] + d["w"] / 2 - cx) ** 2 + (d["y"] + d["h"] / 2 - cy) ** 2)
+
+            if best is not None:
+                box = {"x": best["x_pct"], "y": best["y_pct"], "w": best["w_pct"], "h": best["h_pct"]}
+            elif hint_box:
+                box = dict(hint_box)
+            else:
+                continue
+
+            det = {"x": int(box["x"] / 100 * w_img), "y": int(box["y"] / 100 * h_img),
+                   "w": int(box["w"] / 100 * w_img), "h": int(box["h"] / 100 * h_img)}
+            crop = self._get_crop(img, det)
+            if crop.size == 0:
+                continue
+            shots.append({"crop_b64": self._crop_to_b64(crop), "box": box})
+        return shots
+
+    def register_object_shots(self, crops_b64: list[str], name: str, info: dict) -> dict:
+        """Register an object from several photos: every photo is stored with its 4 variants
+        (mirrored, brighter, darker, blurred), so it's recognized from more angles and in more light."""
+        embeddings = []
+        for crop_b64 in crops_b64:
+            crop = self._decode_frame(crop_b64)
+            if crop is None or crop.size == 0:
+                continue
+            embeddings.extend(self._generate_augmented_embeddings(crop))
+        if not embeddings:
+            return {"error": "Could not generate embeddings"}
+        return self._store_object(name, embeddings, info, photos=len(crops_b64))
+
     def register_object(self, frame_b64: str, name: str, notes: str,
                         dosage: str, schedule: str, category: str,
-                        object_box: dict) -> dict:
-        """Register a new object: crop, embed, store in ChromaDB + JSON."""
+                        object_box: dict, detector_class: str = "") -> dict:
+        """Register a new object from a single frame + box: crop, embed, store in ChromaDB + JSON."""
         img = self._decode_frame(frame_b64)
         if img is None:
             return {"error": "Invalid image"}
@@ -358,34 +544,29 @@ class ObjectProcessor:
         if not embeddings:
             return {"error": "Could not generate embeddings"}
 
+        info = {"notes": notes, "dosage": dosage, "schedule": schedule,
+                "category": category, "detector_class": detector_class}
+        return self._store_object(name, embeddings, info, photos=1)
+
+    def _store_object(self, name: str, embeddings: list, info: dict, photos: int) -> dict:
+        """Save embeddings to ChromaDB and metadata (notes, label text, ...) to patient_context.json."""
         for emb in embeddings:
-            db.add_object_embedding(emb, {"name": name, "category": category})
+            db.add_object_embedding(emb, {"name": name, "category": info.get("category", "")})
 
         # Only add JSON entry if this is a new object (avoid duplicates)
         existing = db.get_object_info(name)
         if not existing:
-            db.add_object_info({
-                "name": name,
-                "notes": notes,
-                "dosage": dosage,
-                "schedule": schedule,
-                "category": category,
-            })
+            db.add_object_info({"name": name, **{k: v or "" for k, v in info.items()}})
         else:
-            # Update metadata if re-registering with new info
-            updates = {}
-            if notes:
-                updates["notes"] = notes
-            if dosage:
-                updates["dosage"] = dosage
-            if schedule:
-                updates["schedule"] = schedule
-            if category:
-                updates["category"] = category
+            # Re-registering adds photos; update metadata only with fields that were filled in
+            updates = {k: v for k, v in info.items() if v}
             if updates:
                 db.update_object_info(name, updates)
 
-        return {"message": f"Object '{name}' registered with {len(embeddings)} embeddings"}
+        # Make sure the detector looks for this kind of object from now on
+        self.refresh_vocabulary()
+
+        return {"message": f"Object '{name}' saved from {photos} photo(s) ({len(embeddings)} embeddings)"}
 
     def get_crop_b64(self, frame_b64: str, box: dict) -> str:
         """Crop a bounding box from a frame and return as base64."""

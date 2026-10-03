@@ -431,7 +431,84 @@ body {
   color: var(--text-color);
   box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
   border-left: 3px solid var(--primary-color);
-  animation: chat-slide-in 0.3s ease-out forwards;
+  /* Fade out just before App.jsx removes the message (CHAT_LIFETIME_MS = 10s) */
+  animation: chat-slide-in 0.3s ease-out forwards, chat-fade-out 0.5s ease-in 9.5s forwards;
+}
+
+@keyframes chat-fade-out {
+  to {
+    opacity: 0;
+    transform: translateX(-20px);
+  }
+}
+
+/* Command mode focus area — keep in sync with CENTER_ZONE in backend/object_processor.py */
+.center-zone {
+  position: absolute;
+  left: 25%;
+  top: 15%;
+  width: 50%;
+  height: 70%;
+  border: 2px dashed rgba(255, 255, 255, 0.6);
+  border-radius: 24px;
+  pointer-events: none;
+  animation: chat-slide-in 0.3s ease-out;
+}
+
+/* Shown while photographing an object for ~3 seconds */
+.capture-overlay {
+  position: absolute;
+  top: 8%;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 12px 24px;
+  border-radius: 30px;
+  background: rgba(30, 60, 114, 0.85);
+  color: #fff;
+  font-size: 18px;
+  font-weight: 600;
+  pointer-events: none;
+}
+
+/* Photos of an object in the save panel */
+.shot-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.shot-thumb {
+  position: relative;
+  aspect-ratio: 1;
+  border-radius: 8px;
+  background-size: cover;
+  background-position: center;
+  background-color: #eee;
+}
+
+.shot-remove {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  font-size: 14px;
+  line-height: 22px;
+  padding: 0;
+  cursor: pointer;
+}
+
+.center-zone-save {
+  position: absolute;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  white-space: nowrap;
 }
 
 .chat-bubble.ambient {
@@ -458,6 +535,8 @@ body {
   right: 20px;
   top: 80px;
   width: 300px;
+  max-height: calc(100vh - 100px);
+  overflow-y: auto;
   background: rgba(255, 255, 255, 0.85);
   backdrop-filter: blur(8px);
   border-radius: 12px;

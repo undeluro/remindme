@@ -60,38 +60,59 @@ def add_face(embedding: list[float], metadata: dict):
         ids=[face_id]
     )
 
-def query_face(embedding: list[float], threshold=0.40) -> dict | None:
-    """Query faces using top-5 results with majority voting for robust identity."""
-    if faces_collection.count() == 0:
-        return None
-    
-    n = min(5, faces_collection.count())
+FACE_MATCH_THRESHOLD = 0.35   # cosine distance; DeepFace's reference value for Facenet512 is 0.30
+FACE_STRONG_MATCH = 0.25      # a single vector this close is trusted without extra votes
+FACE_MIN_VOTES = 2            # otherwise at least this many of the nearest vectors must agree
+
+
+def match_face(embedding: list[float], threshold=FACE_MATCH_THRESHOLD) -> tuple[dict | None, float | None]:
+    """Identify a face by voting over the nearest stored vectors.
+
+    Returns (metadata, best_distance), or (None, None) when no person wins the vote.
+    A single stray vector can no longer decide the identity on its own.
+    """
+    count = faces_collection.count()
+    if count == 0:
+        return None, None
+
     results = faces_collection.query(
         query_embeddings=[embedding],
-        n_results=n
+        n_results=min(10, count)
     )
-    
+
     if not ("distances" in results and results["distances"] and results["distances"][0]):
-        return None
-    
-    # Collect all matches within threshold
-    from collections import Counter
-    name_votes = Counter()
-    best_meta = None
-    best_dist = float('inf')
-    
+        return None, None
+
+    # Group in-threshold matches by person
+    per_name: dict[str, list[float]] = {}
+    best_meta: dict[str, dict] = {}
     for i, dist in enumerate(results["distances"][0]):
-        if dist < threshold:
-            meta = results["metadatas"][0][i]
-            name = meta.get("name", "Unknown")
-            name_votes[name] += 1
-            if dist < best_dist:
-                best_dist = dist
-                best_meta = meta
-    
-    if best_meta:
-        return best_meta
-    return None
+        if dist >= threshold:
+            continue
+        meta = results["metadatas"][0][i]
+        name = meta.get("name", "Unknown")
+        per_name.setdefault(name, []).append(dist)
+        if dist <= min(per_name[name]):
+            best_meta[name] = meta
+
+    if not per_name:
+        return None, None
+
+    # Most votes wins; ties broken by the closest vector
+    winner = max(per_name, key=lambda n: (len(per_name[n]), -min(per_name[n])))
+    votes = len(per_name[winner])
+    best_dist = min(per_name[winner])
+
+    if votes < FACE_MIN_VOTES and best_dist >= FACE_STRONG_MATCH:
+        return None, None
+
+    return best_meta[winner], best_dist
+
+
+def query_face(embedding: list[float], threshold=FACE_MATCH_THRESHOLD) -> dict | None:
+    """Backwards-compatible wrapper around match_face that returns only the metadata."""
+    meta, _ = match_face(embedding, threshold)
+    return meta
 
 def count_face_vectors(name: str) -> int:
     """Count how many embedding vectors exist for a given person name."""
@@ -312,6 +333,29 @@ def query_object(embedding: list[float], threshold=0.30) -> dict | None:
                 return meta
     
     return None
+
+def query_object_candidates(embedding: list[float], threshold=0.30) -> list[dict]:
+    """All saved objects that look similar, best first: [{name, distance, votes}].
+
+    Used when objects look alike (e.g. pill boxes of one brand) and the label text has to decide.
+    """
+    count = objects_collection.count()
+    if count == 0:
+        return []
+    results = objects_collection.query(query_embeddings=[embedding], n_results=min(20, count))
+    if not (results.get("distances") and results["distances"][0]):
+        return []
+
+    per_name: dict[str, dict] = {}
+    for meta, dist in zip(results["metadatas"][0], results["distances"][0]):
+        if dist >= threshold:
+            continue
+        name = meta.get("name", "Unknown")
+        entry = per_name.setdefault(name, {"name": name, "distance": dist, "votes": 0})
+        entry["votes"] += 1
+        entry["distance"] = min(entry["distance"], dist)
+    return sorted(per_name.values(), key=lambda c: (-c["votes"], c["distance"]))
+
 
 def count_object_vectors(name: str) -> int:
     data = objects_collection.get(where={"name": name})

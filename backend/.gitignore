@@ -12,3 +12,5 @@ wheels/
 .env
 
 chroma_data
+# Downloaded model files (YOLOE text encoder)
+*.ts

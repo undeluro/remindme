@@ -13,6 +13,15 @@ const CAMERA_CONSTRAINTS = {
 };
 
 const STREAM_FRAME_SIZE = { width: 960, height: 540 };
+const CHAT_LIFETIME_MS = 10000; // keep in sync with the chat-fade-out delay in index.css
+// Command mode focus area in % of the frame — keep in sync with CENTER_ZONE in backend/object_processor.py
+const CENTER_ZONE_BOX = { x: 25, y: 15, w: 50, h: 70 };
+
+// Saving an object: photos taken while the user slowly turns it
+const CAPTURE_MS = 3000;
+const CAPTURE_INTERVAL_MS = 500;
+const API_BASE = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000';
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const REGISTRATION_FRAME_SIZE = { width: 1280, height: 720 };
 
 function App() {
@@ -33,6 +42,8 @@ function App() {
   // Object recognition state
   const [recognizedObjects, setRecognizedObjects] = useState([]);
   const [objectConfirmData, setObjectConfirmData] = useState(null);
+  const [captureCountdown, setCaptureCountdown] = useState(null);  // seconds left while photographing an object
+  const captureRunningRef = useRef(false);
 
   const webcamRef = useRef(null);
   const wsRef = useRef(null);
@@ -40,11 +51,27 @@ function App() {
   const commandChunksRef = useRef([]);
   const cancelCommandRef = useRef(false);
   const objectTimeoutRef = useRef(null);  // Staleness timer for object overlays
+  const chatIdRef = useRef(0);
+
+  // Add a message to the left-hand log; it fades out and is removed after CHAT_LIFETIME_MS
+  const addChatLog = (role, content) => {
+    const id = ++chatIdRef.current;
+    setChatLogs(prev => [
+      // Only one surroundings description at a time — a new one replaces the old
+      ...(role === 'ambient' ? prev.filter(log => log.role !== 'ambient') : prev).slice(-9),
+      { id, role, content }
+    ]);
+    setTimeout(() => setChatLogs(prev => prev.filter(log => log.id !== id)), CHAT_LIFETIME_MS);
+  };
+
+  const unmountedRef = useRef(false);
 
   useEffect(() => {
     // Basic WebSocket setup to talk to the FastAPI backend
+    unmountedRef.current = false;
     connectWebSocket();
     return () => {
+      unmountedRef.current = true;
       if (wsRef.current) wsRef.current.close();
       if (commandRecorderRef.current && commandRecorderRef.current.state !== 'inactive') {
         commandRecorderRef.current.stop();
@@ -54,17 +81,20 @@ function App() {
 
   const connectWebSocket = () => {
     const wsBase = import.meta.env.VITE_WS_URL || 'ws://localhost:8000';
-    wsRef.current = new WebSocket(`${wsBase}/ws/stream`);
+    const ws = new WebSocket(`${wsBase}/ws/stream`);
+    wsRef.current = ws;
 
-    wsRef.current.onopen = () => {
+    ws.onopen = () => {
       console.log('Connected to companion backend');
     };
 
-    wsRef.current.onerror = (e) => {
+    ws.onerror = (e) => {
       console.error('WebSocket error', e);
     };
 
-    wsRef.current.onmessage = (event) => {
+    ws.onmessage = (event) => {
+      // Ignore anything still arriving on a replaced connection
+      if (wsRef.current !== ws) return;
       try {
         const data = JSON.parse(event.data);
         if (data.type === 'STATE_CHANGE') {
@@ -82,7 +112,7 @@ function App() {
           const audioMsg = new Audio(`data:${mimeType};base64,${b64Data}`);
           audioMsg.play();
         } else if (data.type === 'CHAT') {
-          setChatLogs(prev => [...prev.slice(-9), { role: data.role, content: data.content }]);
+          addChatLog(data.role, data.content);
         } else if (data.type === 'OBJECTS') {
           // Clear any previous staleness timer
           if (objectTimeoutRef.current) clearTimeout(objectTimeoutRef.current);
@@ -90,16 +120,26 @@ function App() {
           // Auto-clear overlays if no update arrives within 6 seconds
           objectTimeoutRef.current = setTimeout(() => setRecognizedObjects([]), 6000);
         } else if (data.type === 'OBJECT_CONFIRM') {
-          setObjectConfirmData(data);
+          // Voice command "remember this ..." — photograph it the same way as the "+ Save" button
+          captureObject(data.object_box, {
+            firstFrame: data.frame_b64,
+            suggested_name: data.suggested_name,
+            note_text: data.note_text,
+            detector_class: data.detector_class,
+          });
         }
       } catch (e) {
         console.error('Failed to parse WS message', e);
       }
     };
 
-    wsRef.current.onclose = () => {
+    ws.onclose = () => {
+      // Only the current connection reconnects — otherwise every closed socket spawns a new one and they pile up
+      if (unmountedRef.current || wsRef.current !== ws) return;
       console.log('WS closed, retrying in 3s');
-      setTimeout(connectWebSocket, 3000);
+      setTimeout(() => {
+        if (!unmountedRef.current && wsRef.current === ws) connectWebSocket();
+      }, 3000);
     }
   };
 
@@ -129,6 +169,66 @@ function App() {
     setIsAddingPerson(true);
     setIsSettingsOpen(false);
     setIsDatabaseOpen(false);
+  };
+
+  // Save an object: photograph it for CAPTURE_MS while the user slowly turns it, then let the
+  // backend crop it in every photo and read its label, and open the save panel with the result.
+  // `box` is where the object is (% of the frame); `extras` pre-fills the panel (voice command).
+  const captureObject = async (box, extras = {}) => {
+    if (!webcamRef.current || captureRunningRef.current) return;
+    captureRunningRef.current = true;
+
+    // Stop the command recording without sending it to Gemini
+    cancelCommandRef.current = true;
+    if (commandRecorderRef.current && commandRecorderRef.current.state !== 'inactive') {
+      commandRecorderRef.current.stop();
+    }
+    setIsSettingsOpen(false);
+    setIsDatabaseOpen(false);
+    setIsAddingPerson(false);
+
+    const frames = extras.firstFrame ? [extras.firstFrame] : [];
+    const shotCount = Math.round(CAPTURE_MS / CAPTURE_INTERVAL_MS);
+    for (let i = 0; i < shotCount; i++) {
+      setCaptureCountdown(Math.ceil(((shotCount - i) * CAPTURE_INTERVAL_MS) / 1000));
+      const shot = webcamRef.current && webcamRef.current.getScreenshot(REGISTRATION_FRAME_SIZE);
+      if (shot) frames.push(shot.split(',')[1]);
+      await sleep(CAPTURE_INTERVAL_MS);
+    }
+    setCaptureCountdown(null);
+
+    // Back to ambient mode while the user fills in the panel
+    setCommandMode(false);
+    setRecognizedObjects([]);
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'COMMAND', command: 'END_COMMAND' }));
+    }
+
+    const panel = {
+      suggested_name: extras.suggested_name || '',
+      note_text: extras.note_text || '',
+      detector_class: extras.detector_class || '',
+    };
+    setObjectConfirmData({ ...panel, loading: true });
+    try {
+      const response = await fetch(`${API_BASE}/api/objects/prepare`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ frames, hint_box: box }),
+      });
+      const data = await response.json();
+      if (data.success) {
+        setObjectConfirmData({ ...panel, loading: false, shots: data.shots, label: data.label || {} });
+      } else {
+        setObjectConfirmData(null);
+        addChatLog('system', data.error || 'Could not find the object in the photos');
+      }
+    } catch {
+      setObjectConfirmData(null);
+      addChatLog('system', 'Could not analyze the photos — is the backend running?');
+    } finally {
+      captureRunningRef.current = false;
+    }
   };
 
   const isMutedRef = useRef(isMuted);
@@ -304,7 +404,10 @@ function App() {
           if (commandMode) {
             setCommandMode(false);
             if (commandRecorderRef.current && commandRecorderRef.current.state !== 'inactive') {
-              commandRecorderRef.current.stop();
+              commandRecorderRef.current.stop();  // onstop sends the command; backend returns to AMBIENT after it
+            } else if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+              // Nothing was recorded (e.g. mic muted) — tell the backend, or it stays stuck in COMMAND mode
+              wsRef.current.send(JSON.stringify({ type: 'COMMAND', command: 'END_COMMAND' }));
             }
           }
         }}
@@ -321,10 +424,31 @@ function App() {
 
       <div className="overlay-layer">
 
+        {/* Command mode only recognizes what's inside this frame (CENTER_ZONE in object_processor.py) */}
+        {commandMode && (
+          <div className="center-zone">
+            {/* Fallback when the detector can't find the object: save whatever is inside the frame */}
+            {!recognizedObjects.some(o => o.targeted) && captureCountdown === null && (
+              <button
+                className="tag-add-btn center-zone-save"
+                onClick={(e) => { e.stopPropagation(); captureObject(CENTER_ZONE_BOX); }}
+              >
+                + Save what's in the frame
+              </button>
+            )}
+          </div>
+        )}
+
+        {captureCountdown !== null && (
+          <div className="capture-overlay">
+            Slowly turn the object… {captureCountdown}
+          </div>
+        )}
+
         {/* Chat / Logs Window Overlay */}
         <div className="chat-window">
-          {chatLogs.map((log, i) => (
-            <div key={i} className={`chat-bubble ${log.role}`}>
+          {chatLogs.map((log) => (
+            <div key={log.id} className={`chat-bubble ${log.role}`}>
               {log.content}
             </div>
           ))}
@@ -384,7 +508,7 @@ function App() {
                 });
                 const data = await response.json();
                 if (data.success) {
-                  setChatLogs(prev => [...prev.slice(-9), { role: "system", content: data.message }]);
+                  addChatLog("system", data.message);
                   setIsAddingPerson(false);
                   setAddPersonSnapshot(null);
                   setAddPersonFaceBox(null);
@@ -411,13 +535,33 @@ function App() {
           </div>
         )}
 
-        {objectConfirmData && (
+        {objectConfirmData && objectConfirmData.loading && (
           <div className="right-panel">
             <h3>Confirm Object</h3>
-            <p>Review the detected object before saving.</p>
-            {objectConfirmData.crop_preview_b64 && (
-              <div className="snapshot-preview" style={{ backgroundImage: `url(data:image/jpeg;base64,${objectConfirmData.crop_preview_b64})` }}></div>
-            )}
+            <p>Analyzing the photos and reading the label…</p>
+          </div>
+        )}
+
+        {objectConfirmData && !objectConfirmData.loading && (
+          <div className="right-panel">
+            <h3>Confirm Object</h3>
+            <p>{objectConfirmData.shots.length} photo(s) — remove any that don't show the object.</p>
+            <div className="shot-grid">
+              {objectConfirmData.shots.map((shot, i) => (
+                <div key={i} className="shot-thumb" style={{ backgroundImage: `url(data:image/jpeg;base64,${shot.crop_b64})` }}>
+                  {objectConfirmData.shots.length > 1 && (
+                    <button
+                      type="button"
+                      className="shot-remove"
+                      title="Remove this photo"
+                      onClick={() => setObjectConfirmData(prev => ({ ...prev, shots: prev.shots.filter((_, j) => j !== i) }))}
+                    >
+                      ×
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
             <form onSubmit={async (e) => {
               e.preventDefault();
               const name = e.target.obj_name.value;
@@ -425,11 +569,14 @@ function App() {
               const category = e.target.obj_category.value;
               const dosage = e.target.obj_dosage.value;
               const schedule = e.target.obj_schedule.value;
+              const labelText = e.target.obj_label.value.trim();
               if (!name) return;
+              const label = objectConfirmData.label || {};
+              // If the user cleared the label text, don't use the label to recognize this object
+              const keepLabel = labelText !== '';
 
               try {
-                const apiBase = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000';
-                const response = await fetch(`${apiBase}/api/objects`, {
+                const response = await fetch(`${API_BASE}/api/objects`, {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({
@@ -438,13 +585,16 @@ function App() {
                     category,
                     dosage,
                     schedule,
-                    frame_b64: objectConfirmData.frame_b64,
-                    object_box: objectConfirmData.object_box,
+                    detector_class: objectConfirmData.detector_class || '',
+                    crops: objectConfirmData.shots.map(s => s.crop_b64),
+                    label_text: labelText,
+                    label_name: keepLabel ? (label.product_name || '') : '',
+                    label_dosage: keepLabel ? (label.dosage || '') : '',
                   })
                 });
                 const data = await response.json();
                 if (data.success) {
-                  setChatLogs(prev => [...prev.slice(-9), { role: "system", content: `Zapamiętałem: ${name} — ${notes}` }]);
+                  addChatLog("system", `Zapamiętałem: ${name} — ${notes}`);
                   setObjectConfirmData(null);
                   // Signal backend to return to AMBIENT mode
                   if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
@@ -457,12 +607,25 @@ function App() {
                 alert("Failed to save object");
               }
             }}>
+              <label>Text on the object (read automatically)</label>
+              <input
+                type="text"
+                name="obj_label"
+                placeholder="Nothing readable — hold the label closer"
+                defaultValue={(objectConfirmData.label || {}).text || ''}
+              />
               <label>Name</label>
-              <input type="text" name="obj_name" required placeholder="e.g. Amoksiklav" defaultValue={objectConfirmData.suggested_name || ''} />
+              <input
+                type="text"
+                name="obj_name"
+                required
+                placeholder="e.g. Amoksiklav"
+                defaultValue={objectConfirmData.suggested_name || (objectConfirmData.label || {}).product_name || ''}
+              />
               <label>Note</label>
               <input type="text" name="obj_notes" placeholder="e.g. Take 3 times a day" defaultValue={objectConfirmData.note_text || ''} />
               <label>Category</label>
-              <select name="obj_category" defaultValue="">
+              <select name="obj_category" defaultValue={(objectConfirmData.label || {}).dosage ? 'medicine' : ''}>
                 <option value="">— Select —</option>
                 <option value="medicine">Medicine</option>
                 <option value="supplement">Supplement</option>
@@ -471,7 +634,7 @@ function App() {
                 <option value="other">Other</option>
               </select>
               <label>Dosage</label>
-              <input type="text" name="obj_dosage" placeholder="e.g. 500mg" />
+              <input type="text" name="obj_dosage" placeholder="e.g. 500mg" defaultValue={(objectConfirmData.label || {}).dosage || ''} />
               <label>Schedule</label>
               <input type="text" name="obj_schedule" placeholder="e.g. 3x daily after meals" />
               <div className="panel-actions">
@@ -488,10 +651,9 @@ function App() {
           </div>
         )}
 
-        {trackedFaces.map((face) => {
-          // Stable key: use name + spatial quadrant so React doesn't swap DOM nodes
-          const quadrant = `${Math.round(face.x / 25)}-${Math.round(face.y / 25)}`;
-          const stableKey = `${face.name}-${quadrant}`;
+        {trackedFaces.map((face, i) => {
+          // Unique per tracked face (from the backend tracker) — duplicate keys leave stale tags on screen
+          const stableKey = face.track_id ?? `${face.name}-${i}`;
           const isUnknown = face.name === "Unknown Person";
           return (
             <div
@@ -550,6 +712,18 @@ function App() {
               <div className="object-name">{obj.name}</div>
               {obj.notes && <div className="object-notes">{obj.notes}</div>}
               {obj.dosage && <div className="object-meta">Dosage: {obj.dosage}</div>}
+              {obj.label && <div className="object-meta">Label: {obj.label}</div>}
+              {obj.targeted && captureCountdown === null && (
+                <button
+                  className="tag-add-btn"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    captureObject({ x: obj.x, y: obj.y, w: obj.w, h: obj.h }, { detector_class: obj.name });
+                  }}
+                >
+                  + Save
+                </button>
+              )}
             </div>
           </div>
         ))}

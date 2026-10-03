@@ -27,11 +27,52 @@
     ],
     "objects": [
         {
-            "name": "my car",
-            "notes": "This is my car.",
+            "name": "Redbull",
+            "notes": "I drink this one in the morning",
+            "dosage": "",
+            "schedule": "one time in the morning",
+            "category": "supplement",
+            "detector_class": ""
+        },
+        {
+            "name": "wentilator",
+            "notes": "wentilator",
             "dosage": "",
             "schedule": "",
-            "category": ""
+            "category": "device",
+            "detector_class": ""
+        },
+        {
+            "name": "kubik rubik",
+            "notes": "My brain toy",
+            "dosage": "",
+            "schedule": "",
+            "category": "other",
+            "detector_class": "medicine box"
+        },
+        {
+            "name": "Bottle",
+            "notes": "My Stanley cup",
+            "dosage": "2 l at day",
+            "schedule": "",
+            "category": "supplement",
+            "detector_class": "cup"
+        },
+        {
+            "name": "headphone",
+            "notes": "pawels headphone",
+            "dosage": "",
+            "schedule": "",
+            "category": "device",
+            "detector_class": "cell phone"
+        },
+        {
+            "name": "ID CARD",
+            "notes": "",
+            "dosage": "",
+            "schedule": "",
+            "category": "other",
+            "detector_class": "cell phone"
         }
     ],
     "face_conversations": {

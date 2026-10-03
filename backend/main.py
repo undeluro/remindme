@@ -12,15 +12,29 @@ ssl._create_default_https_context = ssl._create_unverified_context
 
 load_dotenv()
 
-from face_processor import FaceProcessor
+import cv2
+import numpy as np
+from face_processor import FaceProcessor, FaceTracker
 from audio_processor import AudioProcessor
 from llm_orchestrator import LLMOrchestrator
-from object_processor import ObjectProcessor
+from object_processor import ObjectProcessor, in_center_zone, resolve_by_label, object_payload
+from face_processor import box_iou
 import edge_tts
 import base64
 import db
 
 app = FastAPI()
+
+# Ambient context: skip the Gemini call when the camera image has barely changed
+SCENE_DIFF_MIN = 6.0  # mean absolute grayscale difference (0-255) on a small thumbnail
+
+
+def scene_thumbnail(frame_b64: str):
+    """Tiny blurred grayscale thumbnail used to cheaply detect scene changes."""
+    img = cv2.imdecode(np.frombuffer(base64.b64decode(frame_b64), np.uint8), cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return None
+    return cv2.GaussianBlur(cv2.resize(img, (64, 36)), (5, 5), 0).astype(np.float32)
 
 async def async_generate_tts(text: str, voice: str = "en-US-AriaNeural") -> str:
     """Generate TTS audio and return base64 encoded MP3 string."""
@@ -46,6 +60,10 @@ app.add_middleware(
 face_processor = FaceProcessor()
 audio_processor = AudioProcessor()
 object_processor = ObjectProcessor()
+label_reader = LLMOrchestrator(ws_send_callback=None)  # Gemini client for reading text on objects (HTTP endpoints)
+
+LABEL_READ_MAX_SHOTS = 3  # photos sent to Gemini when reading a label at save time
+LABEL_CACHE_SECONDS = 4.0  # ambient: reuse a label reading for an object that hasn't moved
 
 class AddFaceRequest(BaseModel):
     name: str
@@ -148,8 +166,33 @@ class AddObjectRequest(BaseModel):
     dosage: str = ""
     schedule: str = ""
     category: str = ""
-    frame_b64: str
-    object_box: dict  # {x, y, w, h} as percentages
+    detector_class: str = ""  # what the detector called it (e.g. "pillow") — added to its vocabulary
+    # Either several cropped photos (from /api/objects/prepare) ...
+    crops: list[str] = []
+    # ... or one frame + box (older single-shot path)
+    frame_b64: str | None = None
+    object_box: dict | None = None  # {x, y, w, h} as percentages
+    # Text printed on the object (e.g. medicine name), read by Gemini — used to tell look-alikes apart
+    label_text: str = ""
+    label_name: str = ""
+    label_dosage: str = ""
+
+class PrepareObjectRequest(BaseModel):
+    frames: list[str]  # base64 JPEG frames taken over ~3 seconds while the object is turned
+    hint_box: dict | None = None  # where the object was when "+ Save" was pressed, % of the frame
+
+@app.post("/api/objects/prepare")
+async def prepare_object(req: PrepareObjectRequest):
+    """Find and crop the object in each frame, and read any text printed on it."""
+    shots = await asyncio.to_thread(object_processor.prepare_shots, req.frames, req.hint_box)
+    if not shots:
+        return {"success": False, "error": "Could not find the object in the photos"}
+    # Largest crops are the closest views — best for reading text
+    by_size = sorted(shots, key=lambda s: s["box"]["w"] * s["box"]["h"], reverse=True)
+    label = await label_reader.read_label(
+        [base64.b64decode(s["crop_b64"]) for s in by_size[:LABEL_READ_MAX_SHOTS]]
+    )
+    return {"success": True, "shots": shots, "label": label}
 
 class UpdateObjectRequest(BaseModel):
     notes: str | None = None
@@ -159,10 +202,21 @@ class UpdateObjectRequest(BaseModel):
 
 @app.post("/api/objects")
 async def add_object(req: AddObjectRequest):
-    result = await asyncio.to_thread(
-        object_processor.register_object,
-        req.frame_b64, req.name, req.notes, req.dosage, req.schedule, req.category, req.object_box
-    )
+    if req.crops:
+        info = {
+            "notes": req.notes, "dosage": req.dosage, "schedule": req.schedule,
+            "category": req.category, "detector_class": req.detector_class,
+            "label_text": req.label_text, "label_name": req.label_name, "label_dosage": req.label_dosage,
+        }
+        result = await asyncio.to_thread(object_processor.register_object_shots, req.crops, req.name, info)
+    elif req.frame_b64 and req.object_box:
+        result = await asyncio.to_thread(
+            object_processor.register_object,
+            req.frame_b64, req.name, req.notes, req.dosage, req.schedule, req.category, req.object_box,
+            req.detector_class
+        )
+    else:
+        return {"success": False, "error": "No photos of the object were sent"}
     if "error" in result:
         return {"success": False, "error": result["error"]}
     return {"success": True, "message": result.get("message", "Success")}
@@ -262,25 +316,127 @@ async def websocket_endpoint(websocket: WebSocket):
     latest_frame = None
     session_log = []
     is_active = True  # Per-connection flag to control ambient loop
-    current_faces = []  # Last known visible faces from FRAME handler
-    
+    current_faces = []  # Last known visible faces from the face loop
+    face_tracker = FaceTracker()
+    frame_ready = asyncio.Event()  # Set when a new frame arrives; the face loop only processes the newest one
+    audio_queue: asyncio.Queue = asyncio.Queue(maxsize=2)
+    last_summary = ""  # Last ambient description shown to the user
+    last_summary_thumb = None  # Thumbnail of the frame that produced last_summary
+
     async def ambient_loop():
+        nonlocal last_summary, last_summary_thumb
         try:
             while is_active:
                 await asyncio.sleep(30)
                 if not is_active:
                     break
                 if manager.mode == "AMBIENT" and latest_frame:
+                    frame = latest_frame
+                    thumb = await asyncio.to_thread(scene_thumbnail, frame)
+                    if thumb is not None and last_summary_thumb is not None:
+                        diff = float(np.mean(np.abs(thumb - last_summary_thumb)))
+                        if diff < SCENE_DIFF_MIN:
+                            print(f"Ambient: scene unchanged (diff={diff:.1f}), skipping")
+                            continue
                     print("Running 30-sec Ambient Context Gather...")
-                    summary = await llm.generate_ambient_summary(latest_frame)
-                    if summary:
-                        print(f"Ambient context: {summary}")
-                        session_log.append(f"At {datetime.datetime.now().strftime('%H:%M:%S')}: {summary}")
-                        await _ws_send({"type": "CHAT", "role": "ambient", "content": summary})
+                    summary = await llm.generate_ambient_summary(frame, last_summary)
+                    if not summary:
+                        print("Ambient: Gemini reports no meaningful change")
+                        continue
+                    print(f"Ambient context: {summary}")
+                    last_summary = summary
+                    last_summary_thumb = thumb
+                    session_log.append(f"At {datetime.datetime.now().strftime('%H:%M:%S')}: {summary}")
+                    await _ws_send({"type": "CHAT", "role": "ambient", "content": summary})
         except asyncio.CancelledError:
             pass
         except Exception as e:
             print(f"Ambient loop error: {e}")
+
+    async def face_loop():
+        """Recognize faces on the newest frame only — stale frames are dropped, so tags never lag behind."""
+        try:
+            while True:
+                await frame_ready.wait()
+                frame_ready.clear()
+                frame = latest_frame
+                faces = await asyncio.to_thread(face_processor.process_frame, frame)
+                faces = face_tracker.update(faces)
+                # Command mode: only the person in front of the user (middle of the frame)
+                if manager.mode == "COMMAND":
+                    faces = [f for f in faces if in_center_zone(f["x"], f["y"], f["w"], f["h"])]
+                # Sort by x-position for consistent ordering (prevents tag swapping)
+                faces.sort(key=lambda f: f["x"])
+                # Update current visible faces for command context
+                current_faces.clear()
+                current_faces.extend(faces)
+                # Emit recognized faces back to the React UI
+                await manager.send_json({"type": "FACES", "faces": faces}, websocket)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"Face loop error: {e}")
+
+    async def audio_loop():
+        """Hotword detection runs separately so Whisper never blocks face recognition."""
+        try:
+            while True:
+                audio_data = await audio_queue.get()
+                if manager.mode != "AMBIENT":
+                    continue
+                is_hotword, _transcript = await audio_processor.detect_hotword(audio_data)
+                if is_hotword and manager.mode == "AMBIENT":
+                    print("========== COMMAND MODE ACTIVATED ==========")
+                    await manager.set_mode("COMMAND", websocket)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"Audio loop error: {e}")
+
+    label_cache = []  # [{"box", "reading", "time"}] — recent label readings, so Gemini isn't called every scan
+
+    async def resolve_labels(matched: list[dict]) -> list[dict]:
+        """Use the printed text to pick between look-alike saved objects (e.g. two pill boxes of one brand).
+
+        Reads the label (Gemini) only when a match involves objects saved with label text, at most once
+        per scan, and reuses a reading while the object stays in place.
+        """
+        now = asyncio.get_running_loop().time()
+        label_cache[:] = [c for c in label_cache if now - c["time"] < LABEL_CACHE_SECONDS]
+        read_budget = 1
+        resolved = []
+        for m in matched:
+            candidates = m.pop("_candidates", [m["name"]])
+            crop_jpeg = m.pop("_crop_jpeg", None)
+            needs_label = any(
+                (db.get_object_info(n) or {}).get("label_text") or (db.get_object_info(n) or {}).get("label_name")
+                for n in candidates
+            )
+            if not needs_label:
+                resolved.append(m)
+                continue
+
+            box = {k: m[k] for k in ("x", "y", "w", "h")}
+            cached = next((c for c in label_cache if box_iou(c["box"], box) > 0.3), None)
+            if cached:
+                reading = cached["reading"]
+            elif read_budget > 0 and crop_jpeg:
+                read_budget -= 1
+                reading = await llm.read_label([crop_jpeg])
+                label_cache.append({"box": box, "reading": reading, "time": now})
+            else:
+                resolved.append(m)  # no reading available yet — show the look-alike match for now
+                continue
+
+            name, keep = resolve_by_label(candidates, reading)
+            if not keep:
+                print(f"[ObjectRecog] Label '{reading.get('text', '')[:40]}' matches none of {candidates} — hiding tag")
+                continue
+            if name != m["name"]:
+                print(f"[ObjectRecog] Label text switched match {m['name']} -> {name}")
+                m.update(object_payload(name))
+            resolved.append(m)
+        return resolved
 
     async def object_recognition_loop():
         last_matched_names = set()  # Track previous state to avoid wasteful sends
@@ -312,6 +468,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         continue
                     
                     matched = await asyncio.to_thread(object_processor.recognize_known_objects, latest_frame)
+                    matched = await resolve_labels(matched or [])
                     current_names = frozenset(m["name"] for m in matched) if matched else frozenset()
                     
                     # Only send when the set of matched objects changes
@@ -327,57 +484,44 @@ async def websocket_endpoint(websocket: WebSocket):
 
     bg_task = None
     obj_task = None
-    
+    face_task = None
+    audio_task = None
+
     try:
         await manager.connect(websocket)
         bg_task = asyncio.create_task(ambient_loop())
         obj_task = asyncio.create_task(object_recognition_loop())
-        
+        face_task = asyncio.create_task(face_loop())
+        audio_task = asyncio.create_task(audio_loop())
+
         while True:
             data = await websocket.receive_text()
             payload = json.loads(data)
-            
+
             p_type = payload.get("type")
-            
+
             if p_type == "FRAME":
-                img_data = payload.get("data")
-                latest_frame = img_data
-                
-                # 1. Run Face Processor locally
-                faces = await asyncio.to_thread(face_processor.process_frame, img_data)
-                
-                # Sort by x-position for consistent ordering (prevents tag swapping)
-                faces.sort(key=lambda f: f["x"])
-                
-                # Update current visible faces for voice auto-enrollment
-                current_faces.clear()
-                current_faces.extend(faces)
-                
-                # Emit recognized faces back to the React UI
-                await manager.send_json({"type": "FACES", "faces": faces}, websocket)
+                # Just store it — face_loop picks up the newest frame when it's free
+                latest_frame = payload.get("data")
+                frame_ready.set()
 
             elif p_type == "YOLO_DEBUG":
                 manager.yolo_debug = payload.get("enabled", False)
                 print(f"[Debug] YOLO Debug Mode set to {manager.yolo_debug}")
 
             elif p_type == "AUDIO":
-                audio_data = payload.get("data")
                 if manager.mode == "AMBIENT":
-                    # Hotword detection
-                    is_hotword, transcript_text = await audio_processor.detect_hotword(audio_data)
-                    if is_hotword:
-                        print("========== COMMAND MODE ACTIVATED ==========")
-                        await manager.set_mode("COMMAND", websocket)
-                        continue
+                    # Hand off to audio_loop; if it's behind, drop the oldest chunk
+                    if audio_queue.full():
+                        audio_queue.get_nowait()
+                    audio_queue.put_nowait(payload.get("data"))
 
             elif p_type == "COMMAND_AUDIO_FULL":
                 audio_data = payload.get("data")
                 print("[Native Audio] Sending complete command chunk to Gemini...")
-                
-                # Build face context for the LLM
-                face_context = []
-                if latest_frame:
-                    face_context = await asyncio.to_thread(face_processor.process_frame, latest_frame)
+
+                # Faces currently on screen (already recognized by face_loop)
+                face_context = list(current_faces)
                 
                 # Process command with structured output natively
                 result = await llm.process_command(audio_data, face_context)
@@ -414,6 +558,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 "crop_preview_b64": detection.get("crop_b64", ""),
                                 "suggested_name": result.get("object_name", ""),
                                 "note_text": result.get("note_text", ""),
+                                "detector_class": detection.get("yolo_class", ""),
                                 "object_box": {
                                     "x": detection["x_pct"],
                                     "y": detection["y_pct"],
@@ -480,6 +625,8 @@ async def websocket_endpoint(websocket: WebSocket):
             elif p_type == "COMMAND" and payload.get("command") == "START":
                 print("========== ASSISTING STARTED ==========")
                 is_active = True
+                last_summary = ""
+                last_summary_thumb = None
                 await manager.set_mode("AMBIENT", websocket)
                 bg_task = asyncio.create_task(ambient_loop())
                 obj_task = asyncio.create_task(object_recognition_loop())
@@ -490,9 +637,8 @@ async def websocket_endpoint(websocket: WebSocket):
         print(f"WS Exception in streaming: {e}")
     finally:
         is_active = False
-        if bg_task:
-            bg_task.cancel()
-        if obj_task:
-            obj_task.cancel()
+        for task in (bg_task, obj_task, face_task, audio_task):
+            if task:
+                task.cancel()
         manager.disconnect(websocket)
 
