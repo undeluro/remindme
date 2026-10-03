@@ -1,212 +1,166 @@
-# Kinly: AI Memory Companion
-
 <p align="center">
-  <img src="media/ui.jpg" alt="Kinly — Ambient Mode" width="75%">
-  &nbsp;&nbsp;
-</p>
-<p align="center">
-  <img src="media/ui2.jpg" alt="Kinly — Command Mode" width="25%">
-  <img src="media/ui3.jpg" alt="Kinly — Ambient Mode" width="28%">
+  <img src="frontend/public/favicon.svg" alt="Kinly logo" width="96">
 </p>
 
-Kinly is an ambient AI memory companion designed for smart glasses that supports people with Alzheimer's and cognitive decline. It watches, listens, and remembers — activating only when the user says **"Hey Kinly"**
+<h1 align="center">Kinly</h1>
+
+<p align="center">
+  <b>An ambient memory companion for people living with memory loss.</b><br>
+  <i>From “kin” — the people you love.</i>
+</p>
+
+<p align="center">
+  Hackathon prototype · HackYeah 2026
+</p>
 
 ---
 
-## The Problem
+## Why Kinly
 
-Over 55 million people worldwide live with dementia. They forget faces of loved ones, misplace critical medications, and lose track of daily routines. Every existing assistive tool demands active effort — opening apps, typing, navigating menus — which is exactly what these individuals struggle with.
+Around **57 million people** live with dementia worldwide, and nearly **10 million new cases** are added every year ([WHO](https://www.who.int/news-room/fact-sheets/detail/dementia)). In everyday life that means:
 
-## What It Does
+- **Faces** — not recognising friends and family.
+- **Conversations** — forgetting what was said, sometimes minutes later.
+- **Medicines** — mixing up boxes that look almost the same.
 
-Kinly runs passively on smart glasses (or any webcam device) in two modes:
+Most assistive tools expect the user to open an app, type or navigate menus — exactly what is hard for someone with memory loss. Kinly works the other way round: it runs quietly in the background and helps without being asked. The end goal is **smart glasses**; today's prototype is a **web app** that uses a phone or laptop camera.
 
-**Ambient Mode** — always on, invisible:
-- Recognizes faces and shows names + last conversation topic
-- Detects registered personal objects with metadata overlays (name, dosage, schedule)
-- Logs environmental context every 30 seconds
-- Listens offline for the wake phrase "Hey Kinly" (or "Remind me")
+**Who it's for:** people with early dementia or memory decline, and the families and caregivers who set up the people, objects and medicines for them.
 
-**Command Mode** — triggered by voice:
-- User speaks naturally: *"Remember this is my blood pressure medication, I take it every morning"*
-- System registers objects, adds notes, sets reminders, or retrieves memories
-- Responds with natural speech via text-to-speech
-- Returns to Ambient Mode automatically
+## What it does
 
----
+| | |
+|---|---|
+| **Recognises people** | Shows the name, relation and last conversation topic over each familiar face. |
+| **Remembers conversations** | While a known person is in view, the conversation is collected; 20 s after they leave, Gemini turns it into a short topic saved for that person. Works in any language. |
+| **Knows your things** | Show an object from three sides once (a guided 3 × 2-second capture) and it is recognised from then on — with your note, dosage and schedule. |
+| **Keeps medicines apart** | Reads the name and dosage printed on the box and uses it to tell look-alike packages apart. If the label can't be confirmed, Kinly shows nothing rather than guess. |
+| **“Hey Kinly”** | Say “Hey Kinly” (or “Remind me”), then speak naturally: save a note, set a reminder, remember the object you're holding, add a conversation topic, or ask a question. |
+| **One place for everything** | The Memory Database lets the family view and edit people, topics, notes, objects, routines and reminders. |
 
-## Key Features
+### Two modes
 
-- **Face Recognition** — DeepFace + Facenet512 with 512-dim embeddings, top-5 majority voting, and continuous learning (up to 20 vectors per person)
-- **Voice Identification** — SpeechBrain ECAPA-TDNN with 192-dim voice prints, identifies speakers without seeing their face
-- **Object Recognition** — YOLOv11 detection + DINOv2 384-dim embeddings for personal object matching with metadata overlays
-- **Offline Hotword Detection** — Faster-Whisper (small, int8) runs locally, no cloud listening
-- **Audio-to-Action LLM** — Raw audio + camera frame sent natively to Gemini Flash for multimodal understanding with structured JSON output
-- **Persistent Memory** — ChromaDB vector collections for faces, voices, objects, and session memories + JSON store for notes, reminders, routines
-- **Conversation Tracking** — Local Gemma 3 1B extracts topics per person so the user remembers what they last discussed
-- **Privacy First** — Hotword detection, topic extraction, and all embeddings run locally. Only explicit commands reach the cloud LLM.
-- **Accessible UI** — High-contrast React interface with green face overlays, blue object overlays, and a glow animation synced to microphone volume
+- **Ambient mode** — always on: name tags over faces, tags over saved objects, automatic conversation topics, and a short description of the surroundings when they change.
+- **Command mode** — opened by “Hey Kinly” or the button. Only what is inside the centre frame is recognised; click the screen to send your spoken command.
 
----
+## Screenshots
 
-## Architecture
+<!-- Add the images to docs/images/ with these file names (see docs/images/README.md). -->
 
-```
-Smart Glasses / Webcam
-        │
-        ▼
-  React Frontend ──WebSocket──▶ FastAPI Backend ──▶ ChromaDB
-   (Vite, React 19)              (Python 3.12+)     (Vector DB)
-                                      │
-                          ┌───────────┼───────────┐
-                          ▼           ▼           ▼
-                      DeepFace    YOLOv11     Whisper
-                      ECAPA-TDNN  DINOv2      Gemini
-                      Gemma 3     Edge-TTS
-```
+| | |
+|---|---|
+| ![Command mode: the centre frame and a targeted object with a “+ Save” button](docs/images/command-mode.png) | ![Saving an object: the guided three-side countdown](docs/images/object-capture.png) |
+| **Command mode** — the centre frame and the object to save | **Saving an object** — three sides, a countdown for each |
+| ![The save panel with three photos, the text read from the label and the medicine fields](docs/images/object-save-panel.png) | ![A recognised medicine with its name, note and dosage](docs/images/medicine-tag.png) |
+| **Save panel** — photos, label text, name, dosage | **Medicine** — the right box, with your note and dosage |
+| ![The Memory Database with people and their conversation topics](docs/images/memory-database.png) | ![A conversation topic saved automatically for a person](docs/images/conversation-topic.png) |
+| **Memory Database** — people, topics, objects, reminders | **Conversation topic** — saved after the person leaves |
 
-### Frontend
-- **React 19 + Vite** with WebSocket streaming
-- `react-webcam` for camera capture, `lucide-react` for icons
-- Web Audio API (`AudioContext` + `AnalyserNode`) for FFT-driven glow animation
-- `MediaRecorder` API for WebM audio capture
+## How it works
 
-### Backend
-- **FastAPI + Uvicorn** with async WebSocket handlers
-- Independent processing loops: face detection (1.5s), object scanning (5s), audio chunks (2.5s), context summaries (30s)
-- Structured Pydantic schemas for LLM output
-- `google-genai` SDK for Gemini multimodal inference
-
-### Storage
-- **ChromaDB** — 4 vector collections: `faces` (512-dim), `voices` (192-dim), `objects` (384-dim), `memories` (text)
-- **patient_context.json** — notes, reminders, routines, object metadata, conversation topics
-
----
-
-## ML Models
-
-| Component | Model | Dimensions | Threshold | Purpose |
-|---|---|---|---|---|
-| Face Detection | DeepFace + MTCNN | — | 50px min face | Detect faces in frames |
-| Face Embedding | Facenet512 | 512-dim | 0.40 cosine | Identify known people |
-| Voice Embedding | ECAPA-TDNN (SpeechBrain) | 192-dim | 0.25 cosine | Identify speakers |
-| Hotword Detection | Faster-Whisper (small, int8) | — | phrase match + "Kinly" hint | Detect "Hey Kinly" / "Remind me" offline |
-| Object Detection | YOLOv11 | — | 0.1 confidence | Detect objects in frames |
-| Object Embedding | DINOv2-Small (Meta) | 384-dim | 0.30 cosine | Match personal objects |
-| Command Processing | Gemini 3.1 Flash-Lite | — | structured JSON | Understand audio + vision |
-| Topic Extraction | Gemma 3 1B | — | — | Extract conversation topics locally |
-| Text-to-Speech | Edge-TTS (Azure) | — | — | Spoken responses |
-
----
-
-## Application Flow
-
-1. **Ambient Mode** — Frontend captures 960×540 frames every 1.5s + 2.5s audio chunks, streams over WebSocket
-2. **Face Loop** — DeepFace extracts embeddings → ChromaDB top-5 query → majority voting → green overlay with name
-3. **Object Loop** — YOLO detects objects every ~5s → DINOv2 embeddings → ChromaDB match → blue overlay with metadata
-4. **Context Loop** — Every 30s, Gemini summarizes the current environment → stored in session memory
-5. **Hotword Trigger** — Whisper detects "Hey Kinly" (or "Remind me") → backend sends `STATE_CHANGE` → frontend enters Command Mode
-6. **Command Mode** — Continuous audio recording, glow animation synced to voice, YOLO preview of central object
-7. **Execution** — User taps screen → raw audio + frame sent to Gemini → structured action returned (add_note, set_reminder, recognize_object, retrieve_memory, respond)
-8. **Object Registration** — If action is `recognize_object`: crop → 5 augmented DINOv2 embeddings → ChromaDB + metadata saved
-9. **Response** — Gemini's text response converted to speech via Edge-TTS → played back → return to Ambient Mode
-
----
-
-## Getting Started
-
-### Requirements
-- Python 3.12+
-- Node.js 22+
-- [uv](https://docs.astral.sh/uv/) (Python package manager)
-- Gemini API Key
-
-### Local Development
-
-**Terminal 1 — Backend:**
-```bash
-cd backend
-echo "GEMINI_API_KEY=your-api-key" > .env
-uv run fastapi dev
+```mermaid
+flowchart LR
+    CAM["Camera & microphone<br/>(phone or laptop today,<br/>smart glasses next)"] --> WEB["Web app<br/>React + Vite"]
+    WEB <-->|"WebSocket: frames, audio, tags"| API["FastAPI backend"]
+    API --> LOCAL["On our server<br/>Faces · Objects · Wake word"]
+    API --> CLOUD["Gemini 3.1 Flash-Lite<br/>Commands · Labels · Topics"]
+    API --> MEM[("Memory<br/>ChromaDB + patient_context.json")]
 ```
 
-**Terminal 2 — Frontend:**
-```bash
-cd frontend
-npm install
-npm run dev
+| Component | Model / tool | Notes |
+|---|---|---|
+| Face detection | YuNet (via DeepFace) | ~0.1 s per frame on CPU |
+| Face identity | Facenet512 (DeepFace) | Voting over the nearest stored vectors; tracking smooths names between frames |
+| Wake word | Faster-Whisper `base` (int8) | Runs offline in its own process, with a “Kinly” hint so the name is heard correctly |
+| Object detection | YOLOE-26s (open vocabulary) | A household word list, extended with the type of every saved object |
+| Object identity | DINOv2-small | Each saved photo is stored with mirrored, brighter, darker and blurred variants |
+| Commands, label reading, conversation topics, scene descriptions | Gemini 3.1 Flash-Lite | Structured JSON output |
+| Spoken replies | Edge-TTS | |
+| Memory | ChromaDB + `patient_context.json` | Vectors for faces and objects; notes, reminders, routines, objects and topics as JSON |
+
+### Privacy
+
+- **Stays on our server:** face and object recognition, and listening for the wake word.
+- **Sent to Gemini (Google):** spoken commands, photos of saved objects when reading labels, a camera frame every ~30 s for the surroundings description (only when the scene has changed), and conversation audio with known people — the last one can be turned off in **Settings → Save conversation topics automatically**.
+- **Sent to Microsoft Edge TTS:** the text of spoken replies.
+
+## Getting started
+
+Tested on **Windows 11 with Docker Desktop**.
+
+**Requirements:** Docker Desktop (running) and a [Gemini API key](https://aistudio.google.com/apikey). A Hugging Face token is not needed.
+
+1. **Add your Gemini key.** In PowerShell, in the project folder:
+   ```powershell
+   Set-Content -Path backend\.env -Value "GEMINI_API_KEY=your-key-here" -Encoding ascii
+   ```
+   Use this command rather than `echo ... > .env` — Windows PowerShell writes `echo` output in an encoding the backend can't read.
+
+2. **Start the app:**
+   ```powershell
+   docker compose -f docker-compose.dev.yml up -d --build
+   ```
+   The first build downloads several GB and takes 10–20 minutes; the first start then downloads the AI models (a few more minutes). Later starts take about a minute.
+
+3. **Wait for the backend:**
+   ```powershell
+   docker logs -f remindme-backend-dev
+   ```
+   Wait for `Application startup complete`, then press Ctrl+C.
+
+4. **Open http://localhost:5173** in Chrome or Edge and allow camera and microphone access. Turn the microphone on (button on the right of the bottom bar) to use “Hey Kinly”.
+
+| Task | Command |
+|---|---|
+| Start | `docker compose -f docker-compose.dev.yml up -d` |
+| Stop | `docker compose -f docker-compose.dev.yml down` |
+| Restart the backend | `docker compose -f docker-compose.dev.yml restart backend` |
+| Backend logs | `docker logs -f remindme-backend-dev` |
+| Check the backend | open http://localhost:8000/docs |
+
+### Using an Android phone
+
+With the phone connected by USB (USB debugging on), forward the ports and open the app in Chrome on the phone:
+
+```powershell
+adb reverse tcp:5173 tcp:5173
+adb reverse tcp:8000 tcp:8000
 ```
 
-Open `http://localhost:5173` and allow camera + microphone access.
+Then go to **http://localhost:5173** on the phone. Everything still runs on the laptop; the phone is the camera, microphone and screen.
 
-### Docker Compose
+### Moving to another computer
 
-**Production:**
-```bash
-docker compose up --build
-```
-Frontend on port `80`, backend on port `8000`.
+The face and object vectors live in a Docker volume, not in git. On a new computer the people and objects listed in `patient_context.json` appear, but must be added again to be recognised.
 
-**Development (hot-reload):**
-```bash
-docker compose -f docker-compose.dev.yml up --build
-```
-Frontend on port `5173`, backend on port `8000`.
-
-### Environment Variables
-
-Create `backend/.env`:
-```
-GEMINI_API_KEY=your-gemini-api-key
-```
-
----
-
-## Project Structure
+## Project structure
 
 ```
 kinly/
 ├── backend/
-│   ├── main.py                 # FastAPI WebSocket server & mode orchestration
-│   ├── llm_orchestrator.py     # Gemini command processing & context injection
-│   ├── face_processor.py       # DeepFace + Facenet512 + ChromaDB face pipeline
-│   ├── voice_processor.py      # ECAPA-TDNN voice identification
-│   ├── object_processor.py     # YOLO + DINOv2 object detection & registration
-│   ├── audio_processor.py      # Faster-Whisper hotword detection
-│   ├── db.py                   # ChromaDB vector database management
-│   ├── patient_context.json    # Persistent notes, reminders, routines, objects
-│   ├── chroma_data/            # ChromaDB persistent storage
-│   └── pretrained_models/      # SpeechBrain ECAPA-TDNN weights
+│   ├── main.py               # FastAPI app: WebSocket stream, modes, conversation topics, REST API
+│   ├── face_processor.py     # Face detection + identity, frame-to-frame tracking
+│   ├── object_processor.py   # YOLOE detection, DINOv2 matching, guided capture, label matching
+│   ├── audio_processor.py    # "Hey Kinly" wake-word detection
+│   ├── whisper_worker.py     # Whisper in its own process
+│   ├── llm_orchestrator.py   # Gemini: commands, label reading, conversation topics, scene descriptions
+│   ├── db.py                 # ChromaDB collections + patient_context.json
+│   └── patient_context.json  # Notes, reminders, routines, objects, conversation topics
 ├── frontend/
-│   ├── src/
-│   │   ├── App.jsx             # Main app — webcam, WebSocket, mode switching
-│   │   └── components/
-│   │       ├── CommandBar.jsx  # Command mode UI + glow animation
-│   │       └── DatabasePanel.jsx # CRUD panel for people, objects, notes, reminders
-│   └── public/
-├── docker-compose.yml          # Production deployment
-├── docker-compose.dev.yml      # Development with hot-reload
-└── readme.md
+│   ├── src/App.jsx                       # Camera, WebSocket, modes, tags, object capture
+│   ├── src/components/DatabasePanel.jsx  # Memory Database
+│   ├── src/components/KinlyLogo.jsx      # Logo
+│   └── public/favicon.svg
+├── docs/images/              # Screenshots used in this README
+├── docker-compose.dev.yml    # Development setup (hot reload) — the tested way to run Kinly
+└── docker-compose.yml        # Production setup (nginx) — not tested with the current version
 ```
 
----
+## What's next
 
-## Tech Stack
+- **Smart glasses** — run Kinly on glasses, with hints right in the field of view.
+- **Caregiver dashboard** — family adds people, objects and medicines remotely.
+- **Safety mode** — notice disorientation and alert a caregiver.
+- **Full offline operation** — no cloud AI needed.
 
-**Frontend:** React 19 · Vite · WebSocket · Web Audio API · react-webcam · lucide-react
-
-**Backend:** FastAPI · Uvicorn · google-genai · DeepFace · SpeechBrain · Faster-Whisper · Ultralytics (YOLO) · Transformers (DINOv2, Gemma 3) · ChromaDB · Edge-TTS · OpenCV · Pydantic
-
-**Infrastructure:** Docker · Docker Compose · Nginx
-
----
-
-## Future Roadmap
-
-- **Pretrained personal models** — each patient gets a profile pre-loaded with their specific objects by a caregiver
-- **Multi-angle object registration** — upload multiple photos for stronger embeddings
-- **Voice queries about visible objects** — "What medication is this?"
-- **Safety mode** — detect disorientation, trigger GPS sharing + caregiver alerts
-- **Full offline operation** — edge inference without internet
-- **OCR & barcode scanning** — read labels and expiration dates
-- **Caregiver dashboard** — remote monitoring and multi-user management
+<p align="center"><i>Because no one should forget alone.</i></p>
