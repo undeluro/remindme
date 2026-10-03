@@ -47,6 +47,7 @@ def in_center_zone(x_pct: float, y_pct: float, w_pct: float, h_pct: float) -> bo
 LABEL_MATCH_MIN = 0.6  # how well the read text must match a saved label to count as that object
 SHOT_HINT_MARGIN = 0.25  # saving: the object may move this much (fraction of its size) between photos
 SHOT_MIN_IOU = 0.3  # saving: a detection must overlap the object's last known box this much to be used
+EMBED_BATCH_SIZE = 10  # DINOv2 images per forward pass when saving
 
 
 def object_payload(name: str) -> dict:
@@ -160,6 +161,8 @@ class ObjectProcessor:
         # Inference and vocabulary updates come from different threads (object loop, save requests)
         self._yolo_lock = threading.Lock()
         self._dino_lock = threading.Lock()
+        self._word_pe = {}  # word -> text embedding (1, 1, D); encoding words is slow, so each is done once
+        self._vocabulary = []
         self.yolo_model = YOLO(DETECTOR_WEIGHTS)
         self.refresh_vocabulary()
 
@@ -188,9 +191,18 @@ class ObjectProcessor:
             word = (obj.get("detector_class") or obj.get("name") or "").strip().lower()
             if word and word not in words:
                 words.append(word)
+        if words == self._vocabulary:
+            return
+
         with self._yolo_lock:
-            self.yolo_model.set_classes(words, self.yolo_model.get_text_pe(words))
-        print(f"[ObjectProcessor] Detector vocabulary: {len(words)} words")
+            new_words = [w for w in words if w not in self._word_pe]
+            if new_words:
+                pe = self.yolo_model.get_text_pe(new_words)
+                for i, w in enumerate(new_words):
+                    self._word_pe[w] = pe[:, i:i + 1]
+            self.yolo_model.set_classes(words, torch.cat([self._word_pe[w] for w in words], dim=1))
+        self._vocabulary = words
+        print(f"[ObjectProcessor] Detector vocabulary: {len(words)} words ({len(new_words)} new)")
 
     def _run_yolo(self, img, conf_threshold=None):
         """Run YOLO and return filtered, NMS-deduplicated detections."""
@@ -275,22 +287,39 @@ class ObjectProcessor:
             print(f"[ObjectProcessor] DINOv2 embedding error: {e}")
             return None
 
-    def _generate_augmented_embeddings(self, crop) -> list[list[float]]:
-        """Generate 5 embeddings from augmented versions of the crop."""
-        embeddings = []
-        augmented = [
+    def _augment(self, crop) -> list:
+        """The photo plus 4 variants: mirrored, brighter, darker, blurred."""
+        return [
             crop,
             cv2.flip(crop, 1),
             cv2.convertScaleAbs(crop, alpha=1.15, beta=10),
             cv2.convertScaleAbs(crop, alpha=0.85, beta=-10),
             cv2.GaussianBlur(crop, (3, 3), 0),
         ]
-        for aug in augmented:
-            img_bytes = self._crop_to_bytes(aug)
-            emb = self._generate_embedding(img_bytes)
-            if emb:
-                embeddings.append(emb)
+
+    def _embed_batch(self, crops: list) -> list[list[float]]:
+        """DINOv2 embeddings for many crops in batched forward passes (much faster than one by one).
+
+        Each crop goes through a JPEG round-trip first, exactly like _generate_embedding does at
+        recognition time, so saved and live embeddings are comparable.
+        """
+        images = [Image.open(io.BytesIO(self._crop_to_bytes(c))).convert('RGB') for c in crops if c is not None and c.size]
+        embeddings = []
+        for start in range(0, len(images), EMBED_BATCH_SIZE):
+            batch = images[start:start + EMBED_BATCH_SIZE]
+            try:
+                inputs = self.processor(images=batch, return_tensors="pt").to(self._device)
+                with self._dino_lock, torch.no_grad():
+                    outputs = self.dino_model(**inputs)
+                cls = torch.nn.functional.normalize(outputs.last_hidden_state[:, 0, :], p=2, dim=1)
+                embeddings.extend(cls.cpu().tolist())
+            except Exception as e:
+                print(f"[ObjectProcessor] DINOv2 batch embedding error: {e}")
         return embeddings
+
+    def _generate_augmented_embeddings(self, crop) -> list[list[float]]:
+        """Generate 5 embeddings from augmented versions of the crop."""
+        return self._embed_batch(self._augment(crop))
 
     def _central_detections(self, img) -> list[dict]:
         """YOLO detections whose center lies inside CENTER_ZONE (command mode)."""
@@ -513,12 +542,13 @@ class ObjectProcessor:
     def register_object_shots(self, crops_b64: list[str], name: str, info: dict) -> dict:
         """Register an object from several photos: every photo is stored with its 4 variants
         (mirrored, brighter, darker, blurred), so it's recognized from more angles and in more light."""
-        embeddings = []
+        variants = []
         for crop_b64 in crops_b64:
             crop = self._decode_frame(crop_b64)
             if crop is None or crop.size == 0:
                 continue
-            embeddings.extend(self._generate_augmented_embeddings(crop))
+            variants.extend(self._augment(crop))
+        embeddings = self._embed_batch(variants)
         if not embeddings:
             return {"error": "Could not generate embeddings"}
         return self._store_object(name, embeddings, info, photos=len(crops_b64))

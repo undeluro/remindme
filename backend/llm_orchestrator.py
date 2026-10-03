@@ -2,6 +2,8 @@ import os
 import asyncio
 import base64
 import json
+import cv2
+import numpy as np
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
@@ -46,6 +48,22 @@ class SceneUpdate(BaseModel):
     description: str = Field(
         "", description="One short sentence describing the current surroundings, if changed."
     )
+
+
+LABEL_IMAGE_MAX_SIDE = 640  # px — enough to read a label held near the camera, and faster to upload
+
+
+def _shrink_jpeg(data: bytes) -> bytes:
+    """Downscale a JPEG so its longer side is at most LABEL_IMAGE_MAX_SIDE (smaller upload, faster answer)."""
+    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        return data
+    h, w = img.shape[:2]
+    scale = LABEL_IMAGE_MAX_SIDE / max(h, w)
+    if scale >= 1:
+        return data
+    img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    return cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])[1].tobytes()
 
 
 class LabelReading(BaseModel):
@@ -136,7 +154,7 @@ When the user mentions wanting to remember, save, or recognize an object/item/th
         if not self.client or not images_jpeg:
             return empty
         try:
-            parts = [types.Part.from_bytes(data=img, mime_type="image/jpeg") for img in images_jpeg]
+            parts = [types.Part.from_bytes(data=_shrink_jpeg(img), mime_type="image/jpeg") for img in images_jpeg]
             parts.append(
                 "These photos show the same object from different angles. Read the printed text on it "
                 "(for medicine: the name and the strength). Only report text you can actually read — never guess."
@@ -147,6 +165,8 @@ When the user mentions wanting to remember, save, or recognize an object/item/th
                 config={
                     "response_mime_type": "application/json",
                     "response_json_schema": LabelReading.model_json_schema(),
+                    # Reading text needs no reasoning — thinking only adds latency (~3.9s -> ~2.5s)
+                    "thinking_config": {"thinking_level": "minimal"},
                 }
             )
             reading = LabelReading.model_validate_json(response.text)

@@ -73,6 +73,17 @@
             "schedule": "",
             "category": "other",
             "detector_class": "cell phone"
+        },
+        {
+            "name": "NUROFEN Rapid Mini",
+            "notes": "",
+            "dosage": "400 mg",
+            "schedule": "",
+            "category": "medicine",
+            "detector_class": "blister pack",
+            "label_text": "NUROFEN Rapid Mini 400 mg c\u00e1psulas blandas Ibuprofeno V\u00eda oral",
+            "label_name": "NUROFEN Rapid Mini",
+            "label_dosage": "400 mg"
         }
     ],
     "face_conversations": {

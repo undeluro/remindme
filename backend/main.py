@@ -184,14 +184,28 @@ class PrepareObjectRequest(BaseModel):
 @app.post("/api/objects/prepare")
 async def prepare_object(req: PrepareObjectRequest):
     """Find and crop the object in each frame, and read any text printed on it."""
-    shots = await asyncio.to_thread(object_processor.prepare_shots, req.frames, req.hint_box)
+    if req.hint_box:
+        # Read the label from where the object was (evenly spread frames) while detection runs —
+        # Gemini (~2 s) and detecting the object in every frame (~1-3 s) overlap instead of adding up
+        step = max(1, len(req.frames) // LABEL_READ_MAX_SHOTS)
+        label_frames = req.frames[::step][:LABEL_READ_MAX_SHOTS]
+        hint_crops = await asyncio.to_thread(
+            lambda: [object_processor.get_crop_b64(f, req.hint_box) for f in label_frames]
+        )
+        label_task = asyncio.create_task(
+            label_reader.read_label([base64.b64decode(c) for c in hint_crops if c])
+        )
+        shots = await asyncio.to_thread(object_processor.prepare_shots, req.frames, req.hint_box)
+        label = await label_task
+    else:
+        shots = await asyncio.to_thread(object_processor.prepare_shots, req.frames, req.hint_box)
+        # Largest crops are the closest views — best for reading text
+        by_size = sorted(shots, key=lambda s: s["box"]["w"] * s["box"]["h"], reverse=True)
+        label = await label_reader.read_label(
+            [base64.b64decode(s["crop_b64"]) for s in by_size[:LABEL_READ_MAX_SHOTS]]
+        )
     if not shots:
         return {"success": False, "error": "Could not find the object in the photos"}
-    # Largest crops are the closest views — best for reading text
-    by_size = sorted(shots, key=lambda s: s["box"]["w"] * s["box"]["h"], reverse=True)
-    label = await label_reader.read_label(
-        [base64.b64decode(s["crop_b64"]) for s in by_size[:LABEL_READ_MAX_SHOTS]]
-    )
     return {"success": True, "shots": shots, "label": label}
 
 class UpdateObjectRequest(BaseModel):
@@ -393,17 +407,22 @@ async def websocket_endpoint(websocket: WebSocket):
         except Exception as e:
             print(f"Audio loop error: {e}")
 
-    label_cache = []  # [{"box", "reading", "time"}] — recent label readings, so Gemini isn't called every scan
+    # Recent label readings: [{"box", "reading" (None while Gemini is still reading), "time"}]
+    label_cache = []
+
+    async def read_label_into(entry: dict, crop_jpeg: bytes):
+        """Background task: read a label with Gemini and store it in its cache entry."""
+        entry["reading"] = await llm.read_label([crop_jpeg])
+        entry["time"] = asyncio.get_running_loop().time()
 
     async def resolve_labels(matched: list[dict]) -> list[dict]:
         """Use the printed text to pick between look-alike saved objects (e.g. two pill boxes of one brand).
 
-        Reads the label (Gemini) only when a match involves objects saved with label text, at most once
-        per scan, and reuses a reading while the object stays in place.
+        Gemini reads the label in the background (~2-3 s), so the object loop never waits for it: until
+        the reading arrives the tag says "checking label…", then it is reused while the object stays put.
         """
         now = asyncio.get_running_loop().time()
-        label_cache[:] = [c for c in label_cache if now - c["time"] < LABEL_CACHE_SECONDS]
-        read_budget = 1
+        label_cache[:] = [c for c in label_cache if c["reading"] is None or now - c["time"] < LABEL_CACHE_SECONDS]
         resolved = []
         for m in matched:
             candidates = m.pop("_candidates", [m["name"]])
@@ -418,16 +437,16 @@ async def websocket_endpoint(websocket: WebSocket):
 
             box = {k: m[k] for k in ("x", "y", "w", "h")}
             cached = next((c for c in label_cache if box_iou(c["box"], box) > 0.3), None)
-            if cached:
-                reading = cached["reading"]
-            elif read_budget > 0 and crop_jpeg:
-                read_budget -= 1
-                reading = await llm.read_label([crop_jpeg])
-                label_cache.append({"box": box, "reading": reading, "time": now})
-            else:
-                resolved.append(m)  # no reading available yet — show the look-alike match for now
+            if cached is None and crop_jpeg:
+                cached = {"box": box, "reading": None, "time": now}
+                label_cache.append(cached)
+                asyncio.create_task(read_label_into(cached, crop_jpeg))
+            if cached is None or cached["reading"] is None:
+                m["label"] = "checking label…"  # look-alike match shown until the text confirms it
+                resolved.append(m)
                 continue
 
+            reading = cached["reading"]
             name, keep = resolve_by_label(candidates, reading)
             if not keep:
                 print(f"[ObjectRecog] Label '{reading.get('text', '')[:40]}' matches none of {candidates} — hiding tag")
@@ -469,7 +488,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     
                     matched = await asyncio.to_thread(object_processor.recognize_known_objects, latest_frame)
                     matched = await resolve_labels(matched or [])
-                    current_names = frozenset(m["name"] for m in matched) if matched else frozenset()
+                    # Name + label, so "checking label…" -> real label text also reaches the UI
+                    current_names = frozenset((m["name"], m.get("label", "")) for m in matched) if matched else frozenset()
                     
                     # Only send when the set of matched objects changes
                     if current_names != last_matched_names:
