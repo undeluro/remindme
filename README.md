@@ -51,10 +51,10 @@ Most assistive tools expect the user to open an app, type or navigate menus — 
 |---|---|
 | ![Command mode: the centre frame and a targeted object with a “+ Save” button](docs/images/command-mode.png) | ![Saving an object: the guided three-side countdown](docs/images/object-capture.png) |
 | **Command mode** — the centre frame and the object to save | **Saving an object** — three sides, a countdown for each |
-| ![The save panel with three photos, the text read from the label and the medicine fields](docs/images/object-save-panel.png) | ![A recognised medicine with its name, note and dosage](docs/images/medicine-tag.png) |
-| **Save panel** — photos, label text, name, dosage | **Medicine** — the right box, with your note and dosage |
-| ![The Memory Database with people and their conversation topics](docs/images/memory-database.png) | ![A conversation topic saved automatically for a person](docs/images/conversation-topic.png) |
-| **Memory Database** — people, topics, objects, reminders | **Conversation topic** — saved after the person leaves |
+| ![The save panel with three photos, the text read from the label, category, dosage and schedule](docs/images/object-save-panel.png) | ![The Memory Database, People tab: people with their relations and conversation topics](docs/images/memory-database.png) |
+| **Save panel** — photos, label text, name, dosage | **Memory Database** — people, topics, objects, reminders |
+| ![A recognised medicine with its name, note and dosage](docs/images/medicine-tag.png) | ![The Memory Database, Topics tab: conversation topics saved for each person](docs/images/conversation-topic.png) |
+| **Medicine** — the right box, with your note and dosage | **Conversation topics** — saved automatically for each person |
 
 ## How it works
 

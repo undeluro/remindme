@@ -53,6 +53,23 @@ function App() {
     }
   });
   const autoTopicsRef = useRef(autoTopics);  // read by the WebSocket handlers, which outlive renders
+  // Some cameras/drivers deliver a mirrored picture. Flipping applies to the preview AND the frames sent
+  // to the backend (react-webcam's `mirrored`), so text stays readable for Gemini and tags stay on faces.
+  const [flipCamera, setFlipCamera] = useState(() => {
+    try {
+      return localStorage.getItem('kinly.flipCamera') === 'on';
+    } catch {
+      return false;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('kinly.flipCamera', flipCamera ? 'on' : 'off');
+    } catch {
+      // storage unavailable — the setting just isn't remembered
+    }
+  }, [flipCamera]);
 
   useEffect(() => {
     autoTopicsRef.current = autoTopics;
@@ -482,6 +499,7 @@ function App() {
           screenshotFormat="image/jpeg"
           screenshotQuality={0.92}
           videoConstraints={CAMERA_CONSTRAINTS}
+          mirrored={flipCamera}
         />
       </div>
 
@@ -533,6 +551,14 @@ function App() {
             <h3>Settings</h3>
             <p>Configure application preferences, UI tokens, and API endpoints.</p>
             <div style={{ marginTop: '20px', marginBottom: '20px', display: 'flex', flexDirection: 'column', gap: '14px' }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '10px', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={flipCamera}
+                  onChange={(e) => setFlipCamera(e.target.checked)}
+                />
+                Flip camera horizontally (use if the picture is mirrored)
+              </label>
               <label style={{ display: 'flex', alignItems: 'center', gap: '10px', cursor: 'pointer' }}>
                 <input
                   type="checkbox"

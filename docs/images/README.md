@@ -10,4 +10,4 @@ PNG or JPG both work; if you use JPG, change the extension in the main README to
 | `object-save-panel.png` | The Confirm Object panel: three photos, the text read from the label, name and dosage |
 | `medicine-tag.png` | A recognised medicine box with its name, note and dosage |
 | `memory-database.png` | The Memory Database panel (People with topics, or Objects / Reminders) |
-| `conversation-topic.png` | A face tag showing a conversation topic that was saved automatically |
+| `conversation-topic.png` | Conversation topics saved automatically — the Memory Database Topics tab, or a face tag showing a topic |
